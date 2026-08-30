@@ -216,14 +216,26 @@ internal class SimpleMediaService :
         player: Player,
         callback: MediaLibrarySession.Callback,
     ): MediaLibrarySession =
-        MediaLibrarySession
-            .Builder(
-                service,
-                player,
-                callback,
-            ).setId(this.javaClass.name)
-            .setBitmapLoader(coilBitmapLoader)
-            .build()
+        try {
+            MediaLibrarySession
+                .Builder(
+                    service,
+                    player,
+                    callback,
+                ).setId(this.javaClass.name)
+                .setBitmapLoader(coilBitmapLoader)
+                .build()
+        } catch (e: IllegalStateException) {
+            Logger.w("Service", "Session ID collision on ${this.javaClass.name}, using fallback unique ID: ${e.message}")
+            MediaLibrarySession
+                .Builder(
+                    service,
+                    player,
+                    callback,
+                ).setId("${this.javaClass.name}_${System.currentTimeMillis()}")
+                .setBitmapLoader(coilBitmapLoader)
+                .build()
+        }
 
     private fun isAppInForeground(): Boolean {
         val appProcessInfo = RunningAppProcessInfo()

@@ -358,15 +358,19 @@ class ListenTogetherPlaybackBridge(
         Logger.i(TAG, "Published queue of ${tracks.size} track(s)")
     }
 
-    private fun publishSnapshot() {
+    private suspend fun publishSnapshot() {
         val item = handler.nowPlaying.value ?: return
         if (item.mediaId.isBlank()) return
         lastPublishedTrackId = item.mediaId
         val data = handler.queueData.value as? QueueData.Data
+        val (position, playWhenReady) =
+            withContext(Dispatchers.Main) {
+                handler.player.currentPosition to handler.player.playWhenReady
+            }
         session.sendPlaybackAction(
             action = PlaybackActions.CHANGE_TRACK,
             trackId = item.mediaId,
-            position = handler.player.currentPosition,
+            position = position,
             trackInfo = item.toTrackInfo(),
             queue = data?.listTracks.orEmpty().map { it.toTrackInfo() },
             queueTitle = data?.playlistName.orEmpty(),
@@ -374,9 +378,9 @@ class ListenTogetherPlaybackBridge(
         // A second command, because change_track alone does not say whether it is running —
         // the server explicitly sets IsPlaying=false on a track change.
         session.sendPlaybackAction(
-            action = if (handler.player.playWhenReady) PlaybackActions.PLAY else PlaybackActions.PAUSE,
+            action = if (playWhenReady) PlaybackActions.PLAY else PlaybackActions.PAUSE,
             trackId = "",
-            position = handler.player.currentPosition,
+            position = position,
             trackInfo = null,
         )
         Logger.i(TAG, "Published current state to the room: ${item.mediaId}")
@@ -412,22 +416,21 @@ class ListenTogetherPlaybackBridge(
                 // for a track the host picked from a list — so the PLAY that guests depend on was
                 // dropped on exactly the transitions it exists for. A host who is genuinely paused
                 // simply never satisfies this and the room stays paused.
-                val started =
-                    withTimeoutOrNull(PLAY_SETTLE_TIMEOUT_MS) {
-                        // playWhenReady, not isPlaying: the intent flips the moment the load path
-                        // commits, while audible playback waits for the stream URL to resolve —
-                        // which can take longer than any reasonable timeout. Waiting for audio here
-                        // is why picking a track still left guests paused. Polled, because
-                        // playWhenReady is a plain property with no flow behind it.
-                        while (!handler.player.playWhenReady && !handler.player.isPlaying) {
-                            delay(PLAY_SETTLE_POLL_MS)
-                        }
-                    } != null
+                val (started, currentPos) =
+                    withContext(Dispatchers.Main) {
+                        val isStarted =
+                            withTimeoutOrNull(PLAY_SETTLE_TIMEOUT_MS) {
+                                while (!handler.player.playWhenReady && !handler.player.isPlaying) {
+                                    delay(PLAY_SETTLE_POLL_MS)
+                                }
+                            } != null
+                        isStarted to handler.player.currentPosition
+                    }
                 if (started) {
                     session.sendPlaybackAction(
                         action = PlaybackActions.PLAY,
                         trackId = "",
-                        position = handler.player.currentPosition,
+                        position = currentPos,
                         trackInfo = null,
                     )
                 }
@@ -444,16 +447,16 @@ class ListenTogetherPlaybackBridge(
                 // A host that merely buffers reports isPlaying=false, indistinguishable from a
                 // user pause — and publishing it stops the WHOLE room on one device's hiccup.
                 // playWhenReady carries the intent, so a dip where the two disagree is not news.
-                val intent = handler.player.playWhenReady
-                if (isPlaying != intent) return@collect
-                Logger.i(TAG, "Host publishing ${if (intent) "PLAY" else "PAUSE"}")
+                val intent = handler.playerIntent.value.isPlaying
+                val currentPos = withContext(Dispatchers.Main) { handler.player.currentPosition }
+                Logger.i(TAG, "Host publishing PLAY_PAUSE: isPlaying=$isPlaying intent=$intent pos=$currentPos")
                 session.sendPlaybackAction(
                     action = if (intent) PlaybackActions.PLAY else PlaybackActions.PAUSE,
                     // Deliberately EMPTY. The server rejects a play/pause whose trackId does not
                     // match the track it is holding ("stale_track") and drops it silently; sending
                     // nothing makes it fill in its own current track, which is always right.
                     trackId = "",
-                    position = handler.player.currentPosition,
+                    position = currentPos,
                     trackInfo = null,
                 )
             }
@@ -485,8 +488,9 @@ class ListenTogetherPlaybackBridge(
             if (!state.inRoom || !state.isHost || applyingRemote) return@collect
             if (previousAt == 0L) return@collect
 
+            val isPlaying = withContext(Dispatchers.Main) { handler.player.isPlaying }
             val elapsed = now - previousAt
-            val expected = previous + if (handler.player.isPlaying) elapsed else 0L
+            val expected = previous + if (isPlaying) elapsed else 0L
             if (kotlin.math.abs(progress - expected) < SEEK_DETECT_MS) return@collect
 
             Logger.i(TAG, "Host publishing SEEK to $progress (expected ~$expected)")
