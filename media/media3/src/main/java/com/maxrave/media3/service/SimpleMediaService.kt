@@ -3,18 +3,12 @@ package com.maxrave.media3.service
 import android.app.Activity
 import android.app.ActivityManager
 import android.app.ActivityManager.RunningAppProcessInfo
-import android.app.Notification
-import android.app.NotificationChannel
-import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
-import android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
 import android.os.Binder
-import android.os.Build
 import android.os.IBinder
-import androidx.core.content.getSystemService
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.session.DefaultMediaNotificationProvider
@@ -22,8 +16,6 @@ import androidx.media3.session.MediaController
 import androidx.media3.session.MediaLibraryService
 import androidx.media3.session.MediaSession
 import androidx.media3.session.SessionToken
-import androidx.media3.ui.DefaultMediaDescriptionAdapter
-import androidx.media3.ui.PlayerNotificationManager
 import com.google.common.util.concurrent.MoreExecutors
 import com.maxrave.common.MEDIA_NOTIFICATION
 import com.maxrave.domain.manager.DataStoreManager
@@ -33,16 +25,12 @@ import com.maxrave.media3.R
 import com.maxrave.media3.extension.toCommandButton
 import com.maxrave.media3.utils.CoilBitmapLoader
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.isActive
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import org.koin.core.component.KoinComponent
 import org.koin.core.component.inject
 import org.koin.core.qualifier.named
 import kotlin.system.exitProcess
-import kotlin.time.Duration.Companion.seconds
 
 @UnstableApi
 internal class SimpleMediaService :
@@ -63,7 +51,8 @@ internal class SimpleMediaService :
 
     private val binder = MusicBinder()
 
-    private lateinit var playerNotificationManager: PlayerNotificationManager
+    // Read once in onCreate; gates onUpdateNotification's foreground decision.
+    private var keepServiceAlive: Boolean = false
 
     inner class MusicBinder : Binder() {
         val service: SimpleMediaService
@@ -93,6 +82,10 @@ internal class SimpleMediaService :
     override fun onCreate() {
         super.onCreate()
         Logger.w("Service", "Simple Media Service Created")
+
+        // Read keep-alive preference once at startup; it gates onUpdateNotification so it
+        // must be set before the MediaSession starts emitting playback-state events.
+        keepServiceAlive = runBlocking { dataStoreManager.keepServiceAlive.first() == DataStoreManager.TRUE }
 
         setMediaNotificationProvider(
             DefaultMediaNotificationProvider(
@@ -124,60 +117,6 @@ internal class SimpleMediaService :
         val sessionToken = SessionToken(this, ComponentName(this, SimpleMediaService::class.java))
         val controllerFuture = MediaController.Builder(this, sessionToken).buildAsync()
         controllerFuture.addListener({ controllerFuture.get() }, MoreExecutors.directExecutor())
-
-        if (runBlocking { dataStoreManager.keepServiceAlive.first() == DataStoreManager.TRUE }) {
-            val notificationManager = getSystemService<NotificationManager>()
-            notificationManager?.run {
-                createNotificationChannel(
-                    NotificationChannel(
-                        "media_playback_channel",
-                        "Now playing",
-                        NotificationManager.IMPORTANCE_LOW,
-                    ).apply {
-                        setSound(null, null)
-                        enableLights(false)
-                        enableVibration(false)
-                    },
-                )
-            }
-            playerNotificationManager =
-                PlayerNotificationManager
-                    .Builder(this, 2026, "media_playback_channel")
-                    .setNotificationListener(
-                        object : PlayerNotificationManager.NotificationListener {
-                            override fun onNotificationPosted(
-                                notificationId: Int,
-                                notification: Notification,
-                                ongoing: Boolean,
-                            ) {
-                                fun startFg() {
-                                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                                        startForeground(notificationId, notification, FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
-                                    } else {
-                                        startForeground(notificationId, notification)
-                                    }
-                                }
-                                coroutineScope.launch {
-                                    while (coroutineScope.isActive) {
-                                        startFg()
-                                        delay(30.seconds)
-                                    }
-                                }
-                            }
-                        },
-                    ).setMediaDescriptionAdapter(DefaultMediaDescriptionAdapter(mediaSession?.sessionActivity))
-                    .build()
-            playerNotificationManager.setPlayer(player)
-            playerNotificationManager.setSmallIcon(R.drawable.mono)
-            mediaSession?.platformToken?.let { playerNotificationManager.setMediaSessionToken(it) }
-        }
-
-        simpleMediaServiceHandler.onUpdateNotification = { list ->
-            val commandButtonList = list.map { it.toCommandButton(this) }
-            mediaSession?.setMediaButtonPreferences(
-                commandButtonList,
-            )
-        }
     }
 
     @UnstableApi
@@ -197,7 +136,11 @@ internal class SimpleMediaService :
         session: MediaSession,
         startInForegroundRequired: Boolean,
     ) {
-        super.onUpdateNotification(session, startInForegroundRequired)
+        // When "Keep service alive" is enabled, always pin the service in foreground so
+        // the OS cannot kill it while paused. We reuse Media3's own notification machinery
+        // (DefaultMediaNotificationProvider, notification ID 200) — no second
+        // PlayerNotificationManager or duplicate notification is needed.
+        super.onUpdateNotification(session, keepServiceAlive || startInForegroundRequired)
     }
 
     @UnstableApi
@@ -226,8 +169,28 @@ internal class SimpleMediaService :
     override fun onDestroy() {
         super.onDestroy()
         Logger.w("Service", "Simple Media Service Destroyed")
+        // Always release the MediaSession when this service instance is destroyed.
+        // Without this, a phantom session token lingers in Android's MediaSessionManager
+        // after the OS temporarily kills the service; the next onCreate() then creates a
+        // *second* session, showing two player cards on the lock screen / notification shade.
+        // Note: we intentionally do NOT call simpleMediaServiceHandler.release() here unless
+        // kill-on-exit is set — the player and its ExoPlayer instances are DI singletons that
+        // must survive a service restart so playback can resume seamlessly.
+        runBlocking {
+            try {
+                mediaSession?.run {
+                    player.pause()
+                    player.playWhenReady = false
+                    // Don't release the player — CrossfadeExoPlayerAdapter manages its lifecycle.
+                    release()
+                }
+            } catch (e: Exception) {
+                Logger.e("Service", "Error releasing MediaSession in onDestroy")
+            }
+        }
+        mediaSession = null
         if (simpleMediaServiceHandler.shouldReleaseOnTaskRemoved()) {
-            release()
+            simpleMediaServiceHandler.release()
         }
     }
 
