@@ -447,9 +447,12 @@ class ListenTogetherPlaybackBridge(
                 // A host that merely buffers reports isPlaying=false, indistinguishable from a
                 // user pause — and publishing it stops the WHOLE room on one device's hiccup.
                 // playWhenReady carries the intent, so a dip where the two disagree is not news.
-                val intent = handler.playerIntent.value.isPlaying
-                val currentPos = withContext(Dispatchers.Main) { handler.player.currentPosition }
-                Logger.i(TAG, "Host publishing PLAY_PAUSE: isPlaying=$isPlaying intent=$intent pos=$currentPos")
+                val (intent, currentPos) =
+                    withContext(Dispatchers.Main) {
+                        handler.player.playWhenReady to handler.player.currentPosition
+                    }
+                if (isPlaying != intent) return@collect
+                Logger.i(TAG, "Host publishing ${if (intent) "PLAY" else "PAUSE"}")
                 session.sendPlaybackAction(
                     action = if (intent) PlaybackActions.PLAY else PlaybackActions.PAUSE,
                     // Deliberately EMPTY. The server rejects a play/pause whose trackId does not
