@@ -422,7 +422,7 @@ class ListenTogetherClient(
          * Rooms are only shared by clients pointed at the SAME server, so this default is what
          * makes SimpMusic interoperable out of the box.
          */
-        const val DEFAULT_SERVER_URL = "wss://metroserverx.meowery.eu/ws"
+        const val DEFAULT_SERVER_URL = "wss://metroserver-vjux.onrender.com/ws"
 
         /** Anchors the default monotonic source; see [elapsedRealtime]. */
         private val PROCESS_START = TimeSource.Monotonic.markNow()
