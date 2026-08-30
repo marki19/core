@@ -1445,6 +1445,19 @@ internal class DataStoreManagerImpl(
         }
     }
 
+    override val blurPlayerBackground: Flow<String> =
+        settingsDataStore.data.map { preferences ->
+            preferences[BLUR_PLAYER_BACKGROUND] ?: TRUE
+        }
+
+    override suspend fun setBlurPlayerBackground(blur: Boolean) {
+        withContext(Dispatchers.IO) {
+            settingsDataStore.edit { settings ->
+                settings[BLUR_PLAYER_BACKGROUND] = if (blur) TRUE else FALSE
+            }
+        }
+    }
+
     override val enableLiquidGlass: Flow<String>
         get() =
             settingsDataStore.data.map { preferences ->
@@ -1728,6 +1741,8 @@ internal class DataStoreManagerImpl(
         val CONTRIBUTOR_EMAIL = stringPreferencesKey("contributor_email")
 
         val BACKUP_DOWNLOADED = stringPreferencesKey("backup_downloaded")
+
+        val BLUR_PLAYER_BACKGROUND = stringPreferencesKey("blur_player_background")
 
         val LIQUID_GLASS = stringPreferencesKey("liquid_glass")
 

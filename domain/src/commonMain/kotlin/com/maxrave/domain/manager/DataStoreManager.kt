@@ -429,6 +429,10 @@ interface DataStoreManager {
 
     suspend fun setNowPlayingStyle(style: String)
 
+    val blurPlayerBackground: Flow<String>
+
+    suspend fun setBlurPlayerBackground(blur: Boolean)
+
     /**
      * One of [LYRICS_STYLE_CLASSIC], [LYRICS_STYLE_APPLE_MUSIC]. Deliberately independent of
      * [nowPlayingStyle]: it governs how a lyric line is drawn, everywhere lyrics are drawn —
