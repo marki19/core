@@ -302,14 +302,10 @@ private fun provideResolvingDataSourceFactory(
                     val videoUrl = it.videoUrl
                     if (videoUrl != null && it.expiredTime > now()) {
                         Logger.d("Stream", videoUrl)
-                        Logger.w("Stream", "Video from format")
-                        val is403Url = streamRepository.is403Url(videoUrl).firstOrNull() != false
-                        Logger.d("Stream", "is 403 $is403Url")
-                        if (!is403Url) {
-                            dataSpecReturn = dataSpec.withUri(videoUrl.toUri()).subrange(dataSpec.uriPositionOffset, chunkLength)
-                            resolved = true
-                            return@runBlocking
-                        }
+                        Logger.w("Stream", "Video from format cache")
+                        dataSpecReturn = dataSpec.withUri(videoUrl.toUri()).subrange(dataSpec.uriPositionOffset, chunkLength)
+                        resolved = true
+                        return@runBlocking
                     }
                 }
                 streamRepository
@@ -330,14 +326,10 @@ private fun provideResolvingDataSourceFactory(
                     val audioUrl = it.audioUrl
                     if (audioUrl != null && it.expiredTime > now()) {
                         Logger.d("Stream", audioUrl)
-                        Logger.w("Stream", "Audio from format")
-                        val is403Url = streamRepository.is403Url(audioUrl).firstOrNull() != false
-                        Logger.d("Stream", "is 403 $is403Url")
-                        if (!is403Url) {
-                            dataSpecReturn = dataSpec.withUri(audioUrl.toUri()).subrange(dataSpec.uriPositionOffset, chunkLength)
-                            resolved = true
-                            return@runBlocking
-                        }
+                        Logger.w("Stream", "Audio from format cache")
+                        dataSpecReturn = dataSpec.withUri(audioUrl.toUri()).subrange(dataSpec.uriPositionOffset, chunkLength)
+                        resolved = true
+                        return@runBlocking
                     }
                 }
                 streamRepository
@@ -506,13 +498,12 @@ private fun provideLoadControl(): LoadControl =
     DefaultLoadControl
         .Builder()
         .setBufferDurationsMs(
-            DEFAULT_MIN_BUFFER_MS * 4,
-            DEFAULT_MAX_BUFFER_MS * 4,
-            // bufferForPlaybackMs=
-            0,
-            // bufferForPlaybackAfterRebufferMs=
-            0,
-        ).build()
+            30_000,
+            60_000,
+            2_500,
+            5_000,
+        ).setPrioritizeTimeOverSizeThresholds(true)
+        .build()
 
 @UnstableApi
 private fun provideAudioAttributes(): AudioAttributes =

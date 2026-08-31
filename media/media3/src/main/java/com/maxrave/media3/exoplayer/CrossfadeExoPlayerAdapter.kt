@@ -293,7 +293,7 @@ internal class CrossfadeExoPlayerAdapter(
     // VideoId -> PrecachedPlayer
     private val precachedPlayers = ConcurrentHashMap<String, PrecachedPlayer>()
     private var precacheEnabled = true
-    private val maxPrecacheCount = 2
+    private val maxPrecacheCount = 1
     private var precacheJob: Job? = null
 
     // ========== Crossfade System ==========
@@ -535,7 +535,7 @@ internal class CrossfadeExoPlayerAdapter(
                                 arrayOf(equalizer, crossfadeFilter, sleepFade),
                                 SilenceSkippingAudioProcessor(
                                     2_000_000,
-                                    (20_000 / 2_000_000).toFloat(),
+                                    (20_000f / 2_000_000f),
                                     2_000_000,
                                     0,
                                     256,
@@ -553,11 +553,12 @@ internal class CrossfadeExoPlayerAdapter(
                     DefaultLoadControl
                         .Builder()
                         .setBufferDurationsMs(
-                            DefaultLoadControl.DEFAULT_MIN_BUFFER_MS * 4,
-                            DefaultLoadControl.DEFAULT_MAX_BUFFER_MS * 4,
-                            0,
-                            0,
-                        ).build(),
+                            30_000,
+                            60_000,
+                            2_500,
+                            5_000,
+                        ).setPrioritizeTimeOverSizeThresholds(true)
+                        .build(),
                 ).setWakeMode(C.WAKE_MODE_NETWORK)
                 .setHandleAudioBecomingNoisy(true)
                 .setSeekForwardIncrementMs(5000)
@@ -1654,7 +1655,13 @@ internal class CrossfadeExoPlayerAdapter(
                     val isRetryableSourceError =
                         error.errorCode == PlaybackException.ERROR_CODE_PARSING_CONTAINER_MALFORMED ||
                             error.errorCode == PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS ||
-                            error.errorCode == PlaybackException.ERROR_CODE_IO_FILE_NOT_FOUND
+                            error.errorCode == PlaybackException.ERROR_CODE_IO_FILE_NOT_FOUND ||
+                            error.errorCode == PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED ||
+                            error.errorCode == PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT ||
+                            error.errorCode == PlaybackException.ERROR_CODE_IO_UNSPECIFIED ||
+                            error.errorCode == PlaybackException.ERROR_CODE_IO_READ_POSITION_OUT_OF_RANGE ||
+                            error.errorCode == PlaybackException.ERROR_CODE_AUDIO_TRACK_INIT_FAILED ||
+                            error.errorCode == PlaybackException.ERROR_CODE_DECODER_INIT_FAILED
 
                     val currentVideoId = playlist.getOrNull(localCurrentMediaItemIndex)?.mediaId
                     if (error.errorCode == PlaybackException.ERROR_CODE_IO_FILE_NOT_FOUND) {
@@ -2225,7 +2232,8 @@ internal class CrossfadeExoPlayerAdapter(
                     // Cleanup DJ filters
                     currentPlayerFilter?.enabled = false
                     secondaryPlayerFilter?.enabled = false
-                    // Restore outgoing player's speed/pitch to natural
+                    // Restore outgoing player's volume and speed/pitch to natural
+                    currentPlayer?.volume = internalVolume
                     currentPlayer?.playbackParameters =
                         PlaybackParameters(internalPlaybackSpeed, internalPlaybackPitch)
                     // Cleanup player
@@ -2822,6 +2830,10 @@ internal class CrossfadeExoPlayerAdapter(
         precacheJob =
             coroutineScope.launch {
                 try {
+                    // Small delay to let current track start downloading/playing before initiating background precache
+                    delay(500)
+                    if (!isActive) return@launch
+
                     val indicesToPrecache = mutableListOf<Int>()
 
                     val index = localCurrentMediaItemIndex
