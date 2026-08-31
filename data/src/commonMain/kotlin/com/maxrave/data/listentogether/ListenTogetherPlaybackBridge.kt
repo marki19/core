@@ -531,7 +531,7 @@ class ListenTogetherPlaybackBridge(
                     position = 0L,
                     trackInfo = item.toTrackInfo(),
                     queue = remainingQueue.map { it.toTrackInfo() },
-                    queueTitle = formatJamPermissions(state.permissions),
+                    queueTitle = "",
                 )
                 if (playWhenReady) {
                     session.sendPlaybackAction(
