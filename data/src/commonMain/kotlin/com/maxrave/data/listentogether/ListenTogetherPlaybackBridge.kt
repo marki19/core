@@ -285,8 +285,9 @@ class ListenTogetherPlaybackBridge(
                                 0L
                             }
                         val alreadyPlayingLocally = handler.nowPlaying.value?.mediaId == track.id
+                        val shouldPlay = if (isInitialJoin) isPlaying else (isPlaying || lastRoomPlaying)
                         if (!alreadyPlayingLocally) {
-                            playTrack(track, keepPosition = startAt, playWhenReady = isPlaying)
+                            playTrack(track, keepPosition = startAt, playWhenReady = shouldPlay)
                         } else {
                             updateQueueBehind(track)
                         }
@@ -298,16 +299,6 @@ class ListenTogetherPlaybackBridge(
                         // Apply play/pause transport or remote seek to guest only.
                         // The host's local player is the authoritative source of playback and should not seek on echo snapshots.
                         applyTransport(isPlaying, position)
-                    } else {
-                        // On host: only apply play/pause if state differs, never seek locally
-                        lastPublishedIsPlaying = isPlaying
-                        withContext(Dispatchers.Main) {
-                            if (isPlaying && !handler.player.playWhenReady) {
-                                handler.player.play()
-                            } else if (!isPlaying && handler.player.playWhenReady) {
-                                handler.player.pause()
-                            }
-                        }
                     }
                 } catch (e: Exception) {
                     Logger.e(TAG, "Failed to apply remote state: ${e.message}")
@@ -386,6 +377,9 @@ class ListenTogetherPlaybackBridge(
                 handler.player.seekTo(keepPosition)
             } else {
                 handler.player.seekTo(0L)
+            }
+            if (playWhenReady) {
+                handler.player.play()
             }
         }
     }
@@ -530,17 +524,23 @@ class ListenTogetherPlaybackBridge(
                 lastAppliedTrackId = item.mediaId
                 Logger.i(TAG, "Host publishing track change: ${item.mediaId}")
                 val remainingQueue = repository.room.value.queue.filterNot { it.id == item.mediaId }
+                val playWhenReady = withContext(Dispatchers.Main) { handler.player.playWhenReady }
                 session.sendPlaybackAction(
                     action = PlaybackActions.CHANGE_TRACK,
                     trackId = item.mediaId,
                     position = 0L,
                     trackInfo = item.toTrackInfo(),
                     queue = remainingQueue.map { it.toTrackInfo() },
-                    queueTitle = data?.playlistName.orEmpty(),
+                    queueTitle = formatJamPermissions(state.permissions),
                 )
-                // Note: Do NOT send a premature PLAY command here. Once the host player actually finishes
-                // buffering and starts rendering audio (isPlaying=true), publishPlayPauseAsHost will send PLAY
-                // with the exact live position, preventing elapsed-time accumulation on the server during buffering.
+                if (playWhenReady) {
+                    session.sendPlaybackAction(
+                        action = PlaybackActions.PLAY,
+                        trackId = "",
+                        position = 0L,
+                        trackInfo = null,
+                    )
+                }
             }
     }
 
