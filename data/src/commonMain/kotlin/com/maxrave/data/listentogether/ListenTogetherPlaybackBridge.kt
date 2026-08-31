@@ -183,11 +183,11 @@ class ListenTogetherPlaybackBridge(
             if (room.isHost || applyingRemote) continue
 
             val authoritativePos = session.positionAt(room.position, room.isPlaying)
-            val (localPos, localPlayWhenReady) = withContext(Dispatchers.Main) {
-                handler.player.currentPosition to handler.player.playWhenReady
+            val (localPos, localPlayWhenReady, isPlayingNow) = withContext(Dispatchers.Main) {
+                Triple(handler.player.currentPosition, handler.player.playWhenReady, handler.player.isPlaying)
             }
-            // Respect a local pause the guest made intentionally.
-            if (!localPlayWhenReady) continue
+            // Respect a local pause the guest made intentionally, or wait if still buffering/loading.
+            if (!localPlayWhenReady || !isPlayingNow) continue
 
             val drift = abs(localPos - authoritativePos)
             if (drift > SEEK_TOLERANCE_MS) {
@@ -226,10 +226,10 @@ class ListenTogetherPlaybackBridge(
                 pong.authoritativeServerTime,
                 pong.authoritativeIsPlaying,
             )
-            val (localPos, localPlayWhenReady) = withContext(Dispatchers.Main) {
-                handler.player.currentPosition to handler.player.playWhenReady
+            val (localPos, localPlayWhenReady, isPlayingNow) = withContext(Dispatchers.Main) {
+                Triple(handler.player.currentPosition, handler.player.playWhenReady, handler.player.isPlaying)
             }
-            if (!localPlayWhenReady) return@collect
+            if (!localPlayWhenReady || !isPlayingNow) return@collect
 
             val drift = abs(localPos - authoritativePos)
             if (drift > SEEK_TOLERANCE_MS) {
@@ -271,14 +271,18 @@ class ListenTogetherPlaybackBridge(
                     lastRoomPlaying = isPlaying
 
                     if (trackChanged && track != null) {
+                        val isInitialJoin = lastAppliedTrackId == null
                         lastAppliedTrackId = track.id
                         lastPublishedTrackId = track.id
                         lastPublishedIsPlaying = isPlaying
                         lastAppliedQueueIds = queueIds
+                        // If this is an ongoing track transition in the room, ALWAYS start at 0L (0:00).
+                        // Only seek ahead if a guest is joining an already-playing room for the first time mid-song.
                         val startAt =
-                            when {
-                                position <= 0L -> 0L
-                                else -> session.positionAt(position, isPlaying)
+                            if (isInitialJoin && position > 0L) {
+                                session.positionAt(position, isPlaying)
+                            } else {
+                                0L
                             }
                         playTrack(track, keepPosition = startAt, playWhenReady = isPlaying)
                     } else if (queueChanged && track != null) {
@@ -317,7 +321,8 @@ class ListenTogetherPlaybackBridge(
         val corrected = session.positionAt(position, isPlaying)
         // A small drift is normal and seeking on every tick would stutter; only a real gap is worth
         // a seek, which is also why the host publishes position with each command.
-        if (abs(handler.player.currentPosition - corrected) > SEEK_TOLERANCE_MS) {
+        // Only apply drift seek if the player is actively rendering playback (not buffering at the start of a song).
+        if (handler.player.isPlaying && abs(handler.player.currentPosition - corrected) > SEEK_TOLERANCE_MS) {
             handler.player.seekTo(corrected)
         }
         // playWhenReady, not isPlaying: a track that is still buffering reports isPlaying=false
@@ -527,25 +532,9 @@ class ListenTogetherPlaybackBridge(
                     queue = data?.listTracks.orEmpty().map { it.toTrackInfo() },
                     queueTitle = data?.playlistName.orEmpty(),
                 )
-
-                val (started, currentPos) =
-                    withContext(Dispatchers.Main) {
-                        val isStarted =
-                            withTimeoutOrNull(PLAY_SETTLE_TIMEOUT) {
-                                while (!handler.player.playWhenReady && !handler.player.isPlaying) {
-                                    delay(PLAY_SETTLE_POLL)
-                                }
-                            } != null
-                        isStarted to handler.player.currentPosition
-                    }
-                if (started) {
-                    session.sendPlaybackAction(
-                        action = PlaybackActions.PLAY,
-                        trackId = "",
-                        position = currentPos,
-                        trackInfo = null,
-                    )
-                }
+                // Note: Do NOT send a premature PLAY command here. Once the host player actually finishes
+                // buffering and starts rendering audio (isPlaying=true), publishPlayPauseAsHost will send PLAY
+                // with the exact live position, preventing elapsed-time accumulation on the server during buffering.
             }
     }
 
