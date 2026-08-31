@@ -46,6 +46,12 @@ class ListenTogetherRepositoryImpl(
             session.autoApproveSuggestions = value
         }
 
+    override var isBlockedUser: (String) -> Boolean
+        get() = session.isBlockedUser
+        set(value) {
+            session.isBlockedUser = value
+        }
+
     init {
         scope.launch { session.state.collect { _room.value = it.toDomain() } }
     }

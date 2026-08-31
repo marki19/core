@@ -138,6 +138,7 @@ class ListenTogetherSession(
     /** Host-side conveniences from settings; both default off, matching the design's toggles. */
     var autoApproveJoins: Boolean = false
     var autoApproveSuggestions: Boolean = false
+    var isBlockedUser: (String) -> Boolean = { false }
 
     /** Opens the socket. Joining a room is a separate, later step. */
     fun connect() {
@@ -300,7 +301,10 @@ class ListenTogetherSession(
         }
 
     fun kickUser(userId: String) =
-        launch { client.send(MessageTypes.KICK_USER, KickUserPayload(userId = userId)) }
+        launch {
+            _state.update { s -> s.copy(members = s.members.filterNot { it.userId == userId }) }
+            client.send(MessageTypes.KICK_USER, KickUserPayload(userId = userId, reason = "Removed by host"))
+        }
 
     fun transferHost(userId: String) =
         launch { client.send(MessageTypes.TRANSFER_HOST, TransferHostPayload(newHostId = userId)) }
@@ -597,11 +601,15 @@ class ListenTogetherSession(
 
             MessageTypes.JOIN_REQUEST -> {
                 val p = payload as? JoinRequestPayload ?: return
+                val (name, avatar) = parseUserAndAvatar(p.username)
+                if (isBlockedUser(name)) {
+                    rejectJoin(p.userId)
+                    return
+                }
                 if (autoApproveJoins) {
                     approveJoin(p.userId)
                     return
                 }
-                val (name, avatar) = parseUserAndAvatar(p.username)
                 _state.update { s ->
                     if (s.joinRequests.any { it.userId == p.userId }) {
                         s
@@ -614,6 +622,10 @@ class ListenTogetherSession(
             MessageTypes.USER_JOINED -> {
                 val p = payload as? UserJoinedPayload ?: return
                 val (name, avatar) = parseUserAndAvatar(p.username)
+                if (_state.value.isHost && isBlockedUser(name)) {
+                    kickUser(p.userId)
+                    return
+                }
                 _state.update { s ->
                     if (s.members.any { it.userId == p.userId }) {
                         s

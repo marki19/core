@@ -17,6 +17,7 @@ interface ListenTogetherRepository {
     /** Host conveniences from settings; the implementation applies them where requests arrive. */
     var autoApproveJoins: Boolean
     var autoApproveSuggestions: Boolean
+    var isBlockedUser: (String) -> Boolean
 
     fun connect()
 

@@ -253,49 +253,40 @@ class ListenTogetherPlaybackBridge(
                     isPlaying = it.isPlaying,
                     position = it.position,
                     queueIds = it.queue.map { t -> t.id },
-                ) to (it.inRoom to it.waitingFor.isNotEmpty())
+                ) to it.inRoom
             }
             .distinctUntilChanged()
-            .collect { (snapshot, stateInfo) ->
-                val (inRoom, inBarrier) = stateInfo
+            .collect { (snapshot, inRoom) ->
                 if (!inRoom) return@collect
                 val (track, isPlaying, position, queueIds) = snapshot
                 val isHost = repository.room.value.isHost
-                Logger.i(TAG, "Room says (${if (isHost) "host" else "guest"}): track=${track?.id} playing=$isPlaying pos=$position queue=${queueIds.size} barrier=$inBarrier")
+                if (isHost) return@collect // Host controls playback locally; do not let remote room state override host's player.
+
+                Logger.i(TAG, "Room says (guest): track=${track?.id} playing=$isPlaying pos=$position queue=${queueIds.size}")
                 applyingRemote = true
                 try {
                     val queueChanged = queueIds != lastAppliedQueueIds
                     val trackChanged = track != null && track.id.isNotBlank() && track.id != lastAppliedTrackId
 
-                    // If in buffer barrier, hold playback until all members are ready
-                    val playing = if (inBarrier) {
-                        false
-                    } else if (trackChanged && !isPlaying) {
-                        val state = repository.room.value
-                        val canControl = state.isHost || state.permissions.allowPlayDirect
-                        if (canControl) handler.player.playWhenReady else lastRoomPlaying
-                    } else {
-                        isPlaying
-                    }
-                    lastRoomPlaying = playing
+                    lastRoomPlaying = isPlaying
 
                     if (trackChanged && track != null) {
                         lastAppliedTrackId = track.id
                         lastAppliedQueueIds = queueIds
-                        if (isHost) {
-                            lastPublishedTrackId = track.id
-                        }
                         val startAt =
                             when {
                                 position <= 0L -> 0L
-                                else -> session.positionAt(position, playing)
+                                else -> session.positionAt(position, isPlaying)
                             }
-                        playTrack(track, keepPosition = startAt, playWhenReady = playing)
+                        playTrack(track, keepPosition = startAt, playWhenReady = isPlaying)
+                        applyTransport(isPlaying, position)
                     } else if (queueChanged && track != null) {
                         lastAppliedQueueIds = queueIds
                         updateQueueBehind(track)
+                        // Do not invoke applyTransport when only the queue changed; prevents resetting the active playhead.
+                    } else {
+                        applyTransport(isPlaying, position)
                     }
-                    applyTransport(playing, position)
                 } catch (e: Exception) {
                     Logger.e(TAG, "Failed to apply remote state: ${e.message}")
                 } finally {
@@ -521,13 +512,6 @@ class ListenTogetherPlaybackBridge(
                     queue = data?.listTracks.orEmpty().map { it.toTrackInfo() },
                     queueTitle = data?.playlistName.orEmpty(),
                 )
-
-                // If other members are in the room, wait for buffer barrier to clear before broadcasting PLAY
-                if (state.members.size > 1) {
-                    withTimeoutOrNull(BUFFER_READY_TIMEOUT) {
-                        repository.room.map { it.waitingFor.isEmpty() }.first { it }
-                    }
-                }
 
                 val (started, currentPos) =
                     withContext(Dispatchers.Main) {
