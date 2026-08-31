@@ -10,6 +10,7 @@ import com.maxrave.domain.mediaservice.handler.SimpleMediaState
 import com.maxrave.domain.repository.ListenTogetherRepository
 import com.maxrave.logger.Logger
 import kotlin.math.abs
+import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.TimeSource
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -27,10 +28,10 @@ import org.simpmusic.listentogether.ListenTogetherSession
 import org.simpmusic.listentogether.PlaybackActions
 import org.simpmusic.listentogether.TrackInfo
 
-private const val PLAY_SETTLE_TIMEOUT_MS = 2_000L
+private val PLAY_SETTLE_TIMEOUT = 2000.milliseconds
 
 /** Poll step for the settle wait; playWhenReady has no flow to collect. */
-private const val PLAY_SETTLE_POLL_MS = 50L
+private val PLAY_SETTLE_POLL = 50.milliseconds
 private const val TAG = "ListenTogetherBridge"
 
 /** What the guest reacts to. A data class so `distinctUntilChanged` compares every field. */
@@ -292,7 +293,7 @@ class ListenTogetherPlaybackBridge(
                         playTrack(track, keepPosition = startAt, playWhenReady = playing)
                     } else if (queueChanged && track != null) {
                         lastAppliedQueueIds = queueIds
-                        updateQueueBehind(track, queueIds)
+                        updateQueueBehind(track)
                     }
                     applyTransport(playing, position)
                 } catch (e: Exception) {
@@ -374,7 +375,7 @@ class ListenTogetherPlaybackBridge(
     }
 
     /** Updates the upcoming tracks in the player's queue without interrupting current track playback. */
-    private suspend fun updateQueueBehind(currentTrack: RoomTrack, queueIds: List<String>) {
+    private suspend fun updateQueueBehind(currentTrack: RoomTrack) {
         val isHost = repository.room.value.isHost
         if (isHost) return
         val roomQueue = repository.room.value.queue
@@ -385,9 +386,8 @@ class ListenTogetherPlaybackBridge(
         val rest = ordered.drop(1)
         withContext(Dispatchers.Main) {
             try {
-                val count = handler.player.mediaItemCount
-                if (count > 1) {
-                    handler.player.removeMediaItems(1, count)
+                while (handler.player.mediaItemCount > 1) {
+                    handler.removeMediaItem(1)
                 }
                 if (rest.isNotEmpty()) {
                     handler.addMediaItemList(rest.map { it.toRoomMediaItem() })
@@ -524,7 +524,7 @@ class ListenTogetherPlaybackBridge(
 
                 // If other members are in the room, wait for buffer barrier to clear before broadcasting PLAY
                 if (state.members.size > 1) {
-                    withTimeoutOrNull(BUFFER_READY_TIMEOUT_MS) {
+                    withTimeoutOrNull(BUFFER_READY_TIMEOUT) {
                         repository.room.map { it.waitingFor.isEmpty() }.first { it }
                     }
                 }
@@ -532,9 +532,9 @@ class ListenTogetherPlaybackBridge(
                 val (started, currentPos) =
                     withContext(Dispatchers.Main) {
                         val isStarted =
-                            withTimeoutOrNull(PLAY_SETTLE_TIMEOUT_MS) {
+                            withTimeoutOrNull(PLAY_SETTLE_TIMEOUT) {
                                 while (!handler.player.playWhenReady && !handler.player.isPlaying) {
-                                    delay(PLAY_SETTLE_POLL_MS)
+                                    delay(PLAY_SETTLE_POLL)
                                 }
                             } != null
                         isStarted to handler.player.currentPosition
@@ -691,7 +691,7 @@ class ListenTogetherPlaybackBridge(
          */
         const val SEEK_DETECT_MS = 2_500L
         const val READY_BUFFER_PERCENT = 5
-        const val BUFFER_READY_TIMEOUT_MS = 10_000L
+        val BUFFER_READY_TIMEOUT = 10000.milliseconds
 
         /**
          * How often the background drift-correction loop wakes to compare the local position
