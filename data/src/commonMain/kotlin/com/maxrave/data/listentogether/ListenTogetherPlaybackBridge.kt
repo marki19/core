@@ -6,7 +6,6 @@ import com.maxrave.domain.data.model.listentogether.RoomTrack
 import com.maxrave.domain.data.player.GenericMediaItem
 import com.maxrave.domain.data.player.GenericMediaMetadata
 import com.maxrave.domain.mediaservice.handler.MediaPlayerHandler
-import com.maxrave.domain.mediaservice.handler.QueueData
 import com.maxrave.domain.mediaservice.handler.SimpleMediaState
 import com.maxrave.domain.repository.ListenTogetherRepository
 import com.maxrave.logger.Logger
@@ -14,10 +13,11 @@ import kotlin.math.abs
 import kotlin.time.TimeSource
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filterNotNull
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -451,7 +451,7 @@ class ListenTogetherPlaybackBridge(
     /** Republishes the queue whenever the host's own queue changes. */
     private suspend fun publishQueueAsHost() {
         handler.queueData
-            .map { (it as? QueueData.Data)?.listTracks?.map { t -> t.videoId }.orEmpty() }
+            .map { it?.data?.listTracks?.map { t -> t.videoId }.orEmpty() }
             .distinctUntilChanged()
             .collect { ids ->
                 val state = repository.room.value
@@ -461,7 +461,7 @@ class ListenTogetherPlaybackBridge(
     }
 
     private fun publishQueue() {
-        val data = handler.queueData.value as? QueueData.Data ?: return
+        val data = handler.queueData.value?.data ?: return
         val tracks = data.listTracks.map { it.toTrackInfo() }
         if (tracks.isEmpty()) return
         session.sendQueue(tracks, data.playlistName.orEmpty())
@@ -472,7 +472,7 @@ class ListenTogetherPlaybackBridge(
         val item = handler.nowPlaying.value ?: return
         if (item.mediaId.isBlank()) return
         lastPublishedTrackId = item.mediaId
-        val data = handler.queueData.value as? QueueData.Data
+        val data = handler.queueData.value?.data
         val (position, playWhenReady) =
             withContext(Dispatchers.Main) {
                 handler.player.currentPosition to handler.player.playWhenReady
@@ -507,7 +507,7 @@ class ListenTogetherPlaybackBridge(
                 if (item.mediaId == lastPublishedTrackId) return@collect
                 lastPublishedTrackId = item.mediaId
                 Logger.i(TAG, "Host publishing track change: ${item.mediaId}")
-                val data = handler.queueData.value as? QueueData.Data
+                val data = handler.queueData.value?.data
                 session.sendPlaybackAction(
                     action = PlaybackActions.CHANGE_TRACK,
                     trackId = item.mediaId,
@@ -607,7 +607,7 @@ class ListenTogetherPlaybackBridge(
             val isPlaying = withContext(Dispatchers.Main) { handler.player.isPlaying }
             val elapsed = now - previousAt
             val expected = previous + if (isPlaying) elapsed else 0L
-            if (kotlin.math.abs(progress - expected) < SEEK_DETECT_MS) return@collect
+            if (abs(progress - expected) < SEEK_DETECT_MS) return@collect
 
             Logger.i(TAG, "Host publishing SEEK to $progress (expected ~$expected)")
             session.sendPlaybackAction(
@@ -629,10 +629,10 @@ class ListenTogetherPlaybackBridge(
      */
     private suspend fun answerBufferBarrier() {
         var lastAnsweredTrackId: String? = null
-        kotlinx.coroutines.flow.combine(
+        combine(
             repository.room.map { it.waitingFor to it.currentTrack?.id }.distinctUntilChanged(),
             handler.simpleMediaState,
-        ) { (waitingFor, trackId), state ->
+        ) { (waitingFor, trackId), _ ->
             val room = repository.room.value
             if (trackId.isNullOrBlank() || !room.inRoom) return@combine
             if (room.selfUserId !in waitingFor) {
@@ -651,16 +651,6 @@ class ListenTogetherPlaybackBridge(
             }
         }.collect()
     }
-
-    private fun RoomTrack.toProtocol(): TrackInfo =
-        TrackInfo(
-            id = id,
-            title = title,
-            artist = artist,
-            album = album,
-            duration = durationMs,
-            thumbnail = thumbnail,
-        )
 
     private fun Track.toTrackInfo(): TrackInfo =
         TrackInfo(
