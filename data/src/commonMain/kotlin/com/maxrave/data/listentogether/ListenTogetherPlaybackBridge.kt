@@ -382,8 +382,6 @@ class ListenTogetherPlaybackBridge(
 
     /** Updates the upcoming tracks in the player's queue without interrupting current track playback. */
     private suspend fun updateQueueBehind(currentTrack: RoomTrack) {
-        val isHost = repository.room.value.isHost
-        if (isHost) return
         val roomQueue = repository.room.value.queue
         val ordered =
             (listOf(currentTrack) + roomQueue.filter { it.id != currentTrack.id })

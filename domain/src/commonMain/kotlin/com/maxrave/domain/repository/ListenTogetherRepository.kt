@@ -69,6 +69,8 @@ interface ListenTogetherRepository {
 
     fun playTrackDirect(track: RoomTrack)
 
+    fun playQueuedTrack(index: Int, track: RoomTrack)
+
     fun play()
 
     fun pause()

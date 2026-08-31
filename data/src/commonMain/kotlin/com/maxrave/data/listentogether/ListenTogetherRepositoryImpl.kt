@@ -133,6 +133,10 @@ class ListenTogetherRepositoryImpl(
         session.playTrackDirect(track.toProtocol())
     }
 
+    override fun playQueuedTrack(index: Int, track: RoomTrack) {
+        session.playQueuedTrack(index, track.toProtocol())
+    }
+
     override fun play() {
         session.play()
     }

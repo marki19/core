@@ -328,6 +328,33 @@ class ListenTogetherSession(
             )
         }
 
+    fun playQueuedTrack(index: Int, track: TrackInfo) =
+        launch {
+            val currentQueue = _state.value.queue.toMutableList()
+            val updatedQueue =
+                if (index in currentQueue.indices) {
+                    currentQueue.removeAt(index)
+                    currentQueue
+                } else {
+                    currentQueue.filterNot { it.id == track.id }
+                }
+            _state.update { it.copy(queue = updatedQueue) }
+            sendPlaybackAction(
+                action = PlaybackActions.CHANGE_TRACK,
+                trackId = track.id,
+                position = 0L,
+                trackInfo = track,
+                queue = updatedQueue,
+                queueTitle = formatJamPermissions(_state.value.permissions),
+            )
+            sendPlaybackAction(
+                action = PlaybackActions.PLAY,
+                trackId = "",
+                position = 0L,
+                trackInfo = null,
+            )
+        }
+
     fun play() = launch {
         val currentTrack = _state.value.currentTrack
         if (currentTrack != null) {
