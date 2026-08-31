@@ -284,7 +284,12 @@ class ListenTogetherPlaybackBridge(
                             } else {
                                 0L
                             }
-                        playTrack(track, keepPosition = startAt, playWhenReady = isPlaying)
+                        val alreadyPlayingLocally = handler.nowPlaying.value?.mediaId == track.id
+                        if (!alreadyPlayingLocally) {
+                            playTrack(track, keepPosition = startAt, playWhenReady = isPlaying)
+                        } else {
+                            updateQueueBehind(track)
+                        }
                     } else if (queueChanged && track != null) {
                         lastAppliedQueueIds = queueIds
                         updateQueueBehind(track)
@@ -395,8 +400,9 @@ class ListenTogetherPlaybackBridge(
         val rest = ordered.drop(1)
         withContext(Dispatchers.Main) {
             try {
-                while (handler.player.mediaItemCount > 1) {
-                    handler.removeMediaItem(1)
+                val currentIndex = handler.player.currentMediaItemIndex
+                while (handler.player.mediaItemCount > currentIndex + 1) {
+                    handler.removeMediaItem(currentIndex + 1)
                 }
                 if (rest.isNotEmpty()) {
                     handler.addMediaItemList(rest.map { it.toRoomMediaItem() })
@@ -523,13 +529,13 @@ class ListenTogetherPlaybackBridge(
                 lastPublishedTrackId = item.mediaId
                 lastAppliedTrackId = item.mediaId
                 Logger.i(TAG, "Host publishing track change: ${item.mediaId}")
-                val data = handler.queueData.value?.data
+                val remainingQueue = repository.room.value.queue.filterNot { it.id == item.mediaId }
                 session.sendPlaybackAction(
                     action = PlaybackActions.CHANGE_TRACK,
                     trackId = item.mediaId,
                     position = 0L,
                     trackInfo = item.toTrackInfo(),
-                    queue = data?.listTracks.orEmpty().map { it.toTrackInfo() },
+                    queue = remainingQueue.map { it.toTrackInfo() },
                     queueTitle = data?.playlistName.orEmpty(),
                 )
                 // Note: Do NOT send a premature PLAY command here. Once the host player actually finishes
@@ -652,6 +658,16 @@ class ListenTogetherPlaybackBridge(
             album = album?.name.orEmpty(),
             duration = (durationSeconds?.toLong() ?: 0L) * 1000L,
             thumbnail = thumbnails?.lastOrNull()?.url.orEmpty(),
+        )
+
+    private fun RoomTrack.toTrackInfo(): TrackInfo =
+        TrackInfo(
+            id = id,
+            title = title,
+            artist = artist,
+            album = album,
+            duration = durationMs,
+            thumbnail = thumbnail,
         )
 
     /** The room carries a videoId plus display metadata; the guest resolves its own stream. */
