@@ -78,7 +78,7 @@ class ListenTogetherPlaybackBridge(
     /**
      * Whether the room was playing before the command currently being applied.
      *
-     * Needed because change_track always says "not playing" — see [watchRoomForGuests].
+     * Needed because change_track always says "not playing" — see [watchRoomPlayback].
      */
     private var lastRoomPlaying = false
 
@@ -158,12 +158,12 @@ class ListenTogetherPlaybackBridge(
      * Background clock-skew corrector.
      *
      * Explicit room commands (play, pause, seek, change_track) land immediately and are already
-     * clock-corrected by [ServerClock]. But long-running sessions accumulate hardware clock drift:
+     * clock-corrected by ServerClock. But long-running sessions accumulate hardware clock drift:
      * two devices whose clocks differ by 50 ppm will be 180 ms apart after one hour.
      *
      * Every [DRIFT_CHECK_INTERVAL_MS] this loop wakes up, computes where the room *should* be
      * right now using the server's authoritative `(position, lastActionServerTime)` tuple plus
-     * the calibrated [ServerClock], and silently seeks if the gap exceeds [SEEK_TOLERANCE_MS].
+     * the calibrated ServerClock, and silently seeks if the gap exceeds [SEEK_TOLERANCE_MS].
      *
      * The check is skipped when:
      * - The room is not in a playing state (paused / no track) — nothing to correct.
@@ -284,7 +284,7 @@ class ListenTogetherPlaybackBridge(
                         if (isHost) {
                             lastPublishedTrackId = track.id
                         }
-                        // Decided BEFORE loading, not corrected afterwards: loading with a hardcoded
+                        // Decided BEFORE loading, not corrected afterward: loading with a hardcoded
                         // playWhenReady=true and letting applyTransport pause it is a race, and the
                         // guest wins it by starting to play in a room the host has paused.
                         // A NEW track still starts where the room is, not at zero: someone joining
