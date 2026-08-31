@@ -21,6 +21,7 @@ object ListenTogetherPrefs {
     const val JAM_ALLOW_PLAY_DIRECT = "lt_jam_allow_play_direct"
     const val JAM_ALLOW_SEEK = "lt_jam_allow_seek"
     const val JAM_ALLOW_PLAY_PAUSE = "lt_jam_allow_play_pause"
+    const val JAM_AUTOPLAY = "lt_jam_autoplay"
 
     const val TRUE = "TRUE"
     const val FALSE = "FALSE"

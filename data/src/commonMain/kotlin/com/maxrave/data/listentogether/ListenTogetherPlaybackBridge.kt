@@ -18,6 +18,7 @@ import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -251,55 +252,47 @@ class ListenTogetherPlaybackBridge(
                     isPlaying = it.isPlaying,
                     position = it.position,
                     queueIds = it.queue.map { t -> t.id },
-                ) to it.inRoom
+                ) to (it.inRoom to it.waitingFor.isNotEmpty())
             }
             .distinctUntilChanged()
-            .collect { (snapshot, inRoom) ->
+            .collect { (snapshot, stateInfo) ->
+                val (inRoom, inBarrier) = stateInfo
                 if (!inRoom) return@collect
                 val (track, isPlaying, position, queueIds) = snapshot
                 val isHost = repository.room.value.isHost
-                Logger.i(TAG, "Room says (${if (isHost) "host" else "guest"}): track=${track?.id} playing=$isPlaying pos=$position queue=${queueIds.size}")
+                Logger.i(TAG, "Room says (${if (isHost) "host" else "guest"}): track=${track?.id} playing=$isPlaying pos=$position queue=${queueIds.size} barrier=$inBarrier")
                 applyingRemote = true
                 try {
-                    // Rebuild when the track changes OR when the queue behind it does — the queue
-                    // can legitimately arrive while the same track keeps playing.
                     val queueChanged = queueIds != lastAppliedQueueIds
-                    val trackChanged =
-                        track != null && track.id.isNotBlank() && (track.id != lastAppliedTrackId || queueChanged)
-                    // The server forces IsPlaying=false on EVERY change_track — protocol default,
-                    // not the host pausing. Obeying it pauses the track just loaded, which is why
-                    // the guest sat silent on next, prev AND end-of-song alike. Carry the room's
-                    // previous intent across the change; a real pause arrives as its own command,
-                    // with the track unchanged, and is applied normally.
-                    val playing = if (trackChanged && !isPlaying) {
+                    val trackChanged = track != null && track.id.isNotBlank() && track.id != lastAppliedTrackId
+
+                    // If in buffer barrier, hold playback until all members are ready
+                    val playing = if (inBarrier) {
+                        false
+                    } else if (trackChanged && !isPlaying) {
                         val state = repository.room.value
                         val canControl = state.isHost || state.permissions.allowPlayDirect
                         if (canControl) handler.player.playWhenReady else lastRoomPlaying
-                    } else isPlaying
+                    } else {
+                        isPlaying
+                    }
                     lastRoomPlaying = playing
+
                     if (trackChanged && track != null) {
-                        val sameTrack = track.id == lastAppliedTrackId && track.id == handler.nowPlaying.value?.mediaId
                         lastAppliedTrackId = track.id
                         lastAppliedQueueIds = queueIds
                         if (isHost) {
                             lastPublishedTrackId = track.id
                         }
-                        // Decided BEFORE loading, not corrected afterward: loading with a hardcoded
-                        // playWhenReady=true and letting applyTransport pause it is a race, and the
-                        // guest wins it by starting to play in a room the host has paused.
-                        // A NEW track still starts where the room is, not at zero: someone joining
-                        // a room mid-song must land next to everyone else. Only the same track
-                        // being rebuilt (the queue arrived late) keeps the local playhead.
                         val startAt =
                             when {
-                                sameTrack -> handler.player.currentPosition
-                                // change_track carries position 0, and 0 means "from the top" —
-                                // running it through the clock correction turns it into however
-                                // long ago the last command was, which can seek past the end.
                                 position <= 0L -> 0L
                                 else -> session.positionAt(position, playing)
                             }
-                        playTrack(track, keepPosition = startAt, playWhenReady = playing, sameTrack = sameTrack)
+                        playTrack(track, keepPosition = startAt, playWhenReady = playing)
+                    } else if (queueChanged && track != null) {
+                        lastAppliedQueueIds = queueIds
+                        updateQueueBehind(track, queueIds)
                     }
                     applyTransport(playing, position)
                 } catch (e: Exception) {
@@ -359,10 +352,8 @@ class ListenTogetherPlaybackBridge(
         info: RoomTrack,
         keepPosition: Long = 0L,
         playWhenReady: Boolean,
-        sameTrack: Boolean = false,
     ) {
         val roomQueue = repository.room.value.queue
-        // Metrolist's canonicalPlaybackQueue: the current track leads, upcoming follows, no dupes.
         val ordered =
             (listOf(info) + roomQueue.filter { it.id != info.id })
                 .filter { it.id.isNotBlank() }
@@ -372,23 +363,37 @@ class ListenTogetherPlaybackBridge(
         // Dispatchers.Main is mandatory, not tidiness: Media3 throws if the player is touched off
         // the main thread, and the bridge runs on the service scope (Default).
         withContext(Dispatchers.Main) {
-            if (sameTrack && handler.player.mediaItemCount > 0) {
-                // If it's the exact same playing track, just update the queue *behind* it
-                // to avoid stopping playback.
-                while (handler.player.mediaItemCount > 1) {
-                    handler.player.removeMediaItem(1)
+            handler.clearMediaItems()
+            handler.addMediaItem(ordered.first().toRoomMediaItem(), playWhenReady = playWhenReady)
+            val rest = ordered.drop(1)
+            if (rest.isNotEmpty()) handler.addMediaItemList(rest.map { it.toRoomMediaItem() })
+            if (keepPosition > 0L) {
+                handler.player.seekTo(keepPosition)
+            }
+        }
+    }
+
+    /** Updates the upcoming tracks in the player's queue without interrupting current track playback. */
+    private suspend fun updateQueueBehind(currentTrack: RoomTrack, queueIds: List<String>) {
+        val isHost = repository.room.value.isHost
+        if (isHost) return
+        val roomQueue = repository.room.value.queue
+        val ordered =
+            (listOf(currentTrack) + roomQueue.filter { it.id != currentTrack.id })
+                .filter { it.id.isNotBlank() }
+                .distinctBy { it.id }
+        val rest = ordered.drop(1)
+        withContext(Dispatchers.Main) {
+            try {
+                val count = handler.player.mediaItemCount
+                if (count > 1) {
+                    handler.player.removeMediaItems(1, count)
                 }
-                val rest = ordered.drop(1)
-                if (rest.isNotEmpty()) handler.addMediaItemList(rest.map { it.toRoomMediaItem() })
-            } else {
-                handler.clearMediaItems()
-                handler.addMediaItem(ordered.first().toRoomMediaItem(), playWhenReady = playWhenReady)
-                val rest = ordered.drop(1)
-                if (rest.isNotEmpty()) handler.addMediaItemList(rest.map { it.toRoomMediaItem() })
-                // Rebuilding restarts the track; if only the queue changed, put the playhead back.
-                if (keepPosition > 0L) {
-                    handler.player.seekTo(keepPosition)
+                if (rest.isNotEmpty()) {
+                    handler.addMediaItemList(rest.map { it.toRoomMediaItem() })
                 }
+            } catch (e: Exception) {
+                Logger.e(TAG, "Error updating queue behind current track: ${e.message}")
             }
         }
     }
@@ -516,17 +521,14 @@ class ListenTogetherPlaybackBridge(
                     queue = data?.listTracks.orEmpty().map { it.toTrackInfo() },
                     queueTitle = data?.playlistName.orEmpty(),
                 )
-                // change_track alone leaves the room paused: the server sets IsPlaying=false on
-                // every track change. The host's own controlState does NOT change when one playing
-                // track follows another, so nothing else would ever send this and guests would load
-                // each new track and sit there stopped.
-                //
-                // Whether the host is actually going to play this, decided by WAITING rather than
-                // by sampling. Reading playWhenReady inline was wrong twice over: it is false while
-                // a next-track buffers, and false again for a moment while the player is rebuilt
-                // for a track the host picked from a list — so the PLAY that guests depend on was
-                // dropped on exactly the transitions it exists for. A host who is genuinely paused
-                // simply never satisfies this and the room stays paused.
+
+                // If other members are in the room, wait for buffer barrier to clear before broadcasting PLAY
+                if (state.members.size > 1) {
+                    withTimeoutOrNull(BUFFER_READY_TIMEOUT_MS) {
+                        repository.room.map { it.waitingFor.isEmpty() }.first { it }
+                    }
+                }
+
                 val (started, currentPos) =
                     withContext(Dispatchers.Main) {
                         val isStarted =
@@ -689,6 +691,7 @@ class ListenTogetherPlaybackBridge(
          */
         const val SEEK_DETECT_MS = 2_500L
         const val READY_BUFFER_PERCENT = 5
+        const val BUFFER_READY_TIMEOUT_MS = 10_000L
 
         /**
          * How often the background drift-correction loop wakes to compare the local position
