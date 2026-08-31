@@ -285,20 +285,28 @@ class ListenTogetherPlaybackBridge(
                                 0L
                             }
                         val alreadyPlayingLocally = handler.nowPlaying.value?.mediaId == track.id
-                        val shouldPlay = if (isInitialJoin) isPlaying else (isPlaying || lastRoomPlaying)
+                        // When joining a room already playing mid-song, start playback.
+                        // On new track transitions, wait for the host's PLAY command so everyone starts in sync.
+                        val shouldPlay = if (isInitialJoin) isPlaying else false
                         if (!alreadyPlayingLocally) {
                             playTrack(track, keepPosition = startAt, playWhenReady = shouldPlay)
-                        } else {
-                            updateQueueBehind(track)
                         }
                     } else if (queueChanged && track != null) {
                         lastAppliedQueueIds = queueIds
-                        updateQueueBehind(track)
-                        // Do not invoke applyTransport when only the queue changed; prevents resetting the active playhead.
+                        // Queue changed (reorder/add/remove): the room UI observes repository.room.value.queue.
+                        // Do not touch active player timeline to prevent member restarts.
                     } else if (!isHost) {
-                        // Apply play/pause transport or remote seek to guest only.
-                        // The host's local player is the authoritative source of playback and should not seek on echo snapshots.
+                        // Apply play/pause transport or remote seek to guest.
                         applyTransport(isPlaying, position)
+                    } else {
+                        // On host: apply remote play/pause if a member with permission paused or resumed the room
+                        withContext(Dispatchers.Main) {
+                            if (isPlaying && !handler.player.playWhenReady) {
+                                handler.player.play()
+                            } else if (!isPlaying && handler.player.playWhenReady) {
+                                handler.player.pause()
+                            }
+                        }
                     }
                 } catch (e: Exception) {
                     Logger.e(TAG, "Failed to apply remote state: ${e.message}")
@@ -371,8 +379,6 @@ class ListenTogetherPlaybackBridge(
         withContext(Dispatchers.Main) {
             handler.clearMediaItems()
             handler.addMediaItem(ordered.first().toRoomMediaItem(), playWhenReady = playWhenReady)
-            val rest = ordered.drop(1)
-            if (rest.isNotEmpty()) handler.addMediaItemList(rest.map { it.toRoomMediaItem() })
             if (keepPosition > 0L) {
                 handler.player.seekTo(keepPosition)
             } else {
@@ -524,7 +530,6 @@ class ListenTogetherPlaybackBridge(
                 lastAppliedTrackId = item.mediaId
                 Logger.i(TAG, "Host publishing track change: ${item.mediaId}")
                 val remainingQueue = repository.room.value.queue.filterNot { it.id == item.mediaId }
-                val playWhenReady = withContext(Dispatchers.Main) { handler.player.playWhenReady }
                 session.sendPlaybackAction(
                     action = PlaybackActions.CHANGE_TRACK,
                     trackId = item.mediaId,
@@ -533,14 +538,9 @@ class ListenTogetherPlaybackBridge(
                     queue = remainingQueue.map { it.toTrackInfo() },
                     queueTitle = "",
                 )
-                if (playWhenReady) {
-                    session.sendPlaybackAction(
-                        action = PlaybackActions.PLAY,
-                        trackId = "",
-                        position = 0L,
-                        trackInfo = null,
-                    )
-                }
+                // Note: Do NOT send premature PLAY here. Once the host finishes buffering and actually
+                // starts playing audio (isPlaying=true), publishPlayPauseAsHost will send PLAY with 0L.
+                // This ensures all members wait for the host to finish buffering and everyone starts together!
             }
     }
 
