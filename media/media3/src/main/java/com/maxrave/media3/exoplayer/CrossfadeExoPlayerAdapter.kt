@@ -523,8 +523,8 @@ internal class CrossfadeExoPlayerAdapter(
                 ): AudioSink =
                     DefaultAudioSink
                         .Builder(context)
-                        .setEnableFloatOutput(enableFloatOutput)
-                        .setEnableAudioOutputPlaybackParameters(enableAudioTrackPlaybackParams)
+                        .setEnableFloatOutput(false)
+                        .setEnableAudioOutputPlaybackParameters(false)
                         .setAudioProcessorChain(
                             DefaultAudioSink.DefaultAudioProcessorChain(
                                 // Equalizer first, matching the desktop graph, where the ten

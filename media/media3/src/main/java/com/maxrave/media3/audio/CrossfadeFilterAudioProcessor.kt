@@ -84,10 +84,10 @@ class CrossfadeFilterAudioProcessor : BaseAudioProcessor() {
         val remaining = inputBuffer.remaining()
         if (remaining == 0) return
 
+        val output = replaceOutputBuffer(remaining)
+
         if (!enabled || sampleRate == 0) {
-            // Pass through: copy input to output (avoid put(sameBuffer) which throws)
-            val output = replaceOutputBuffer(remaining)
-            copyBuffer(inputBuffer, output, remaining)
+            output.put(inputBuffer)
             output.flip()
             return
         }
@@ -102,37 +102,21 @@ class CrossfadeFilterAudioProcessor : BaseAudioProcessor() {
             coefficientsDirty = false
         }
 
-        val output = replaceOutputBuffer(remaining)
         inputBuffer.order(ByteOrder.nativeOrder())
 
         when (channelCount) {
             1 -> processMonoBlock(inputBuffer, output)
             2 -> processStereoBlock(inputBuffer, output)
             else -> {
-                // Unsupported channel count: pass through
-                copyBuffer(inputBuffer, output, remaining)
+                output.put(inputBuffer)
             }
         }
 
-        output.flip()
-    }
+        while (inputBuffer.hasRemaining()) {
+            output.put(inputBuffer.get())
+        }
 
-    /**
-     * Copy bytes from src to dst. Use this instead of dst.put(src) because
-     * replaceOutputBuffer() may return the same buffer as input, and
-     * ByteBuffer.put(ByteBuffer) throws if source and destination are the same.
-     */
-    private fun copyBuffer(src: ByteBuffer, dst: ByteBuffer, size: Int) {
-        if (src === dst) {
-            dst.position(0)
-            dst.limit(size)
-            return
-        }
-        val pos = src.position()
-        for (i in 0 until size) {
-            dst.put(src.get(pos + i))
-        }
-        src.position(pos + size)
+        output.flip()
     }
 
     private fun processMonoBlock(input: ByteBuffer, output: ByteBuffer) {
