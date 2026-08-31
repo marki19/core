@@ -561,11 +561,11 @@ fun GenericMediaMetadata.toMedia3MediaMetadata(): MediaMetadata =
 
 fun MediaMetadata.toGenericMediaMetadata(): GenericMediaMetadata =
     GenericMediaMetadata(
-        title = title?.toString(),
-        artist = artist?.toString(),
-        albumTitle = albumTitle?.toString(),
-        artworkUri = artworkUri.toString(),
-        description = description?.toString(),
+        title = title?.toString()?.takeIf { it != "null" && it.isNotBlank() },
+        artist = artist?.toString()?.takeIf { it != "null" && it.isNotBlank() },
+        albumTitle = albumTitle?.toString()?.takeIf { it != "null" && it.isNotBlank() },
+        artworkUri = artworkUri?.toString()?.takeIf { it != "null" && it.isNotBlank() },
+        description = description?.toString()?.takeIf { it != "null" && it.isNotBlank() },
     )
 
 internal fun GenericPlaybackParameters.toMedia3PlaybackParameters(): PlaybackParameters = PlaybackParameters(speed, pitch)

@@ -603,13 +603,12 @@ class JvmMediaPlayerHandlerImpl(
                     val song: SongEntity =
                         if (songEntity != null) {
                             _controlState.update { it.copy(isLiked = songEntity.liked) }
-                            val thumbUrl =
-                                Regex("=w\\d+-h\\d+").replace(
-                                    track?.thumbnails?.lastOrNull()?.url
-                                        ?: songEntity.thumbnails
-                                        ?: "http://i.ytimg.com/vi/${songEntity.videoId}/maxresdefault.jpg",
-                                    "=w544-h544",
-                                )
+                            val rawThumb =
+                                track?.thumbnails?.lastOrNull()?.url?.takeIf { it != "null" && it.isNotBlank() }
+                                    ?: songEntity.thumbnails?.takeIf { it != "null" && it.isNotBlank() }
+                                    ?: mediaItem.metadata.artworkUri?.takeIf { it != "null" && it.isNotBlank() }
+                                    ?: "http://i.ytimg.com/vi/${songEntity.videoId}/maxresdefault.jpg"
+                            val thumbUrl = Regex("=w\\d+-h\\d+").replace(rawThumb, "=w544-h544")
                             if (songEntity.thumbnails != thumbUrl) {
                                 songRepository.updateThumbnailsSongEntity(thumbUrl, songEntity.videoId).singleOrNull()?.let {
                                     Logger.w(TAG, "getDataOfNowPlayingState: Updated thumbs $it")
@@ -633,12 +632,11 @@ class JvmMediaPlayerHandlerImpl(
                             songEntity.copy(thumbnails = thumbUrl)
                         } else {
                             _controlState.update { it.copy(isLiked = false) }
-                            val thumbUrl =
-                                Regex("=w\\d+-h\\d+").replace(
-                                    track?.thumbnails?.lastOrNull()?.url
-                                        ?: "http://i.ytimg.com/vi/${track?.videoId}/maxresdefault.jpg",
-                                    "=w544-h544",
-                                )
+                            val rawThumb =
+                                track?.thumbnails?.lastOrNull()?.url?.takeIf { it != "null" && it.isNotBlank() }
+                                    ?: mediaItem.metadata.artworkUri?.takeIf { it != "null" && it.isNotBlank() }
+                                    ?: "http://i.ytimg.com/vi/${videoId}/maxresdefault.jpg"
+                            val thumbUrl = Regex("=w\\d+-h\\d+").replace(rawThumb, "=w544-h544")
                             val newSong =
                                 (track?.toSongEntity() ?: mediaItem.toSongEntity()).copy(
                                     thumbnails = thumbUrl,

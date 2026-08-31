@@ -716,8 +716,7 @@ class ListenTogetherSession(
                         p.action == PlaybackActions.QUEUE_ADD ||
                             p.action == PlaybackActions.QUEUE_REMOVE ||
                             p.action == PlaybackActions.QUEUE_CLEAR ||
-                            p.action == PlaybackActions.SYNC_QUEUE ||
-                            p.action == PlaybackActions.CHANGE_TRACK
+                            p.action == PlaybackActions.SYNC_QUEUE
                     it.copy(
                         currentTrack = newCurrentTrack,
                         isPlaying =

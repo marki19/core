@@ -278,13 +278,23 @@ class ListenTogetherPlaybackBridge(
                                 else -> session.positionAt(position, isPlaying)
                             }
                         playTrack(track, keepPosition = startAt, playWhenReady = isPlaying)
-                        applyTransport(isPlaying, position)
                     } else if (queueChanged && track != null) {
                         lastAppliedQueueIds = queueIds
                         updateQueueBehind(track)
                         // Do not invoke applyTransport when only the queue changed; prevents resetting the active playhead.
-                    } else {
+                    } else if (!isHost) {
+                        // Apply play/pause transport or remote seek to guest only.
+                        // The host's local player is the authoritative source of playback and should not seek on echo snapshots.
                         applyTransport(isPlaying, position)
+                    } else {
+                        // On host: only apply play/pause if state differs, never seek locally
+                        withContext(Dispatchers.Main) {
+                            if (isPlaying && !handler.player.playWhenReady) {
+                                handler.player.play()
+                            } else if (!isPlaying && handler.player.playWhenReady) {
+                                handler.player.pause()
+                            }
+                        }
                     }
                 } catch (e: Exception) {
                     Logger.e(TAG, "Failed to apply remote state: ${e.message}")
@@ -360,6 +370,8 @@ class ListenTogetherPlaybackBridge(
             if (rest.isNotEmpty()) handler.addMediaItemList(rest.map { it.toRoomMediaItem() })
             if (keepPosition > 0L) {
                 handler.player.seekTo(keepPosition)
+            } else {
+                handler.player.seekTo(0L)
             }
         }
     }
