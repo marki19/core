@@ -260,9 +260,8 @@ class ListenTogetherPlaybackBridge(
                 if (!inRoom) return@collect
                 val (track, isPlaying, position, queueIds) = snapshot
                 val isHost = repository.room.value.isHost
-                if (isHost) return@collect // Host controls playback locally; do not let remote room state override host's player.
 
-                Logger.i(TAG, "Room says (guest): track=${track?.id} playing=$isPlaying pos=$position queue=${queueIds.size}")
+                Logger.i(TAG, "Room says (${if (isHost) "host" else "guest"}): track=${track?.id} playing=$isPlaying pos=$position queue=${queueIds.size}")
                 applyingRemote = true
                 try {
                     val queueChanged = queueIds != lastAppliedQueueIds
@@ -468,6 +467,7 @@ class ListenTogetherPlaybackBridge(
         val item = handler.nowPlaying.value ?: return
         if (item.mediaId.isBlank()) return
         lastPublishedTrackId = item.mediaId
+        lastAppliedTrackId = item.mediaId
         val data = handler.queueData.value?.data
         val (position, playWhenReady) =
             withContext(Dispatchers.Main) {
@@ -502,6 +502,7 @@ class ListenTogetherPlaybackBridge(
                 if (!state.inRoom || !canControl || applyingRemote) return@collect
                 if (item.mediaId == lastPublishedTrackId) return@collect
                 lastPublishedTrackId = item.mediaId
+                lastAppliedTrackId = item.mediaId
                 Logger.i(TAG, "Host publishing track change: ${item.mediaId}")
                 val data = handler.queueData.value?.data
                 session.sendPlaybackAction(
