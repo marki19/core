@@ -76,6 +76,7 @@ class ListenTogetherPlaybackBridge(
     private var lastPublishedTrackId: String? = null
     private var lastAppliedTrackId: String? = null
     private var lastAppliedQueueIds: List<String> = emptyList()
+    private var lastPublishedIsPlaying: Boolean? = null
 
     /**
      * Whether the room was playing before the command currently being applied.
@@ -271,6 +272,8 @@ class ListenTogetherPlaybackBridge(
 
                     if (trackChanged && track != null) {
                         lastAppliedTrackId = track.id
+                        lastPublishedTrackId = track.id
+                        lastPublishedIsPlaying = isPlaying
                         lastAppliedQueueIds = queueIds
                         val startAt =
                             when {
@@ -288,6 +291,7 @@ class ListenTogetherPlaybackBridge(
                         applyTransport(isPlaying, position)
                     } else {
                         // On host: only apply play/pause if state differs, never seek locally
+                        lastPublishedIsPlaying = isPlaying
                         withContext(Dispatchers.Main) {
                             if (isPlaying && !handler.player.playWhenReady) {
                                 handler.player.play()
@@ -563,6 +567,8 @@ class ListenTogetherPlaybackBridge(
                         handler.player.playWhenReady to handler.player.currentPosition
                     }
                 if (isPlaying != intent) return@collect
+                if (lastPublishedIsPlaying == intent) return@collect
+                lastPublishedIsPlaying = intent
                 Logger.i(TAG, "Host publishing ${if (intent) "PLAY" else "PAUSE"}")
                 session.sendPlaybackAction(
                     action = if (intent) PlaybackActions.PLAY else PlaybackActions.PAUSE,

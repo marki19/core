@@ -322,7 +322,7 @@ class ListenTogetherSession(
             )
             sendPlaybackAction(
                 action = PlaybackActions.PLAY,
-                trackId = track.id,
+                trackId = "",
                 position = 0L,
                 trackInfo = null,
             )
@@ -787,9 +787,8 @@ class ListenTogetherSession(
 
             MessageTypes.ERROR -> {
                 val p = payload as? ErrorPayload ?: return
-                // `rate_limited` is about one message, not the session, and showing it would put an
-                // alarming banner up for something the user cannot act on.
-                if (p.code != "rate_limited") {
+                // `rate_limited` and `stale_track` are in-flight race conditions, not fatal session errors.
+                if (p.code != "rate_limited" && p.code != "stale_track") {
                     Logger.w(TAG, "Server error ${p.code}: ${p.message}")
                     val isTerminal =
                         p.code in setOf(
