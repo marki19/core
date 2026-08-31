@@ -54,21 +54,45 @@ class ListenTogetherRepositoryImpl(
 
     override fun disconnect() = session.disconnect()
 
-    override fun createRoom(username: String) {
-        session.createRoom(username)
+    override fun createRoom(
+        username: String,
+        avatarUrl: String?,
+    ) {
+        session.createRoom(username, avatarUrl)
     }
 
     override fun joinRoom(
         roomCode: String,
         username: String,
+        avatarUrl: String?,
     ) {
-        session.joinRoom(roomCode, username)
+        session.joinRoom(roomCode, username, avatarUrl)
+    }
+
+    override fun sendChatMessage(
+        text: String,
+        replyToId: String?,
+        replyToText: String?,
+        replyToSenderName: String?,
+    ) {
+        session.sendChatMessage(text, replyToId, replyToText, replyToSenderName)
+    }
+
+    override fun reactToMessage(
+        messageId: String,
+        emoji: String,
+    ) {
+        session.reactToChatMessage(messageId, emoji)
     }
 
     override fun cancelJoin() = session.cancelJoin()
 
     override fun leaveRoom() {
         session.leaveRoom()
+    }
+
+    override fun endRoom() {
+        session.endRoom()
     }
 
     override fun approveJoin(userId: String) {
@@ -99,6 +123,52 @@ class ListenTogetherRepositoryImpl(
         session.suggestTrack(track.toProtocol())
     }
 
+    override fun playTrackDirect(track: RoomTrack) {
+        session.playTrackDirect(track.toProtocol())
+    }
+
+    override fun play() {
+        session.play()
+    }
+
+    override fun pause() {
+        session.pause()
+    }
+
+    override fun seekTo(position: Long) {
+        session.seekTo(position)
+    }
+
+    override fun addToQueue(track: RoomTrack) {
+        session.addToQueue(track.toProtocol())
+    }
+
+    override fun reorderQueue(fromIndex: Int, toIndex: Int) {
+        session.reorderQueue(fromIndex, toIndex)
+    }
+
+    override fun removeQueueItem(index: Int) {
+        session.removeQueueItem(index)
+    }
+
+    override fun updateJamPermissions(
+        allowQueue: Boolean,
+        allowReorder: Boolean,
+        allowPlayDirect: Boolean,
+        allowSeek: Boolean,
+        allowPlayPause: Boolean,
+    ) {
+        session.updateJamPermissions(
+            org.simpmusic.listentogether.JamPermissionsState(
+                allowQueue = allowQueue,
+                allowReorder = allowReorder,
+                allowPlayDirect = allowPlayDirect,
+                allowSeek = allowSeek,
+                allowPlayPause = allowPlayPause,
+            ),
+        )
+    }
+
     override fun requestSync() {
         session.requestSync()
     }
@@ -119,6 +189,29 @@ private fun ListenTogetherState.toDomain() =
         queue = queue.map { it.toDomain() },
         isPlaying = isPlaying,
         position = position,
+        permissions =
+            com.maxrave.domain.data.model.listentogether.JamPermissions(
+                allowQueue = permissions.allowQueue,
+                allowReorder = permissions.allowReorder,
+                allowPlayDirect = permissions.allowPlayDirect,
+                allowSeek = permissions.allowSeek,
+                allowPlayPause = permissions.allowPlayPause,
+            ),
+        chatMessages =
+            chatMessages.map {
+                com.maxrave.domain.data.model.listentogether.JamChatMessage(
+                    id = it.id,
+                    senderId = it.senderId,
+                    senderName = it.senderName,
+                    senderAvatar = it.senderAvatar,
+                    text = it.text,
+                    timestamp = it.timestamp,
+                    replyToId = it.replyToId,
+                    replyToText = it.replyToText,
+                    replyToSenderName = it.replyToSenderName,
+                    reactions = it.reactions,
+                )
+            },
         waitingFor = waitingFor,
         pendingJoinCode = pendingJoinCode,
         error = error,
@@ -138,10 +231,11 @@ private fun ProtocolMember.toDomain() =
         username = username,
         isHost = isHost,
         isConnected = isConnected,
+        avatarUrl = avatarUrl,
         isBuffering = isBuffering,
     )
 
-private fun PendingJoin.toDomain() = RoomJoinRequest(userId = userId, username = username)
+private fun PendingJoin.toDomain() = RoomJoinRequest(userId = userId, username = username, avatarUrl = avatarUrl)
 
 private fun PendingSuggestion.toDomain() =
     RoomSuggestion(

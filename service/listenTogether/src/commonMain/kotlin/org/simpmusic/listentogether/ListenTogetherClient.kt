@@ -72,6 +72,20 @@ sealed interface ListenTogetherEvent {
     data object ClockReady : ListenTogetherEvent
 
     /**
+     * A pong with optional server-authoritative room state.
+     *
+     * Emitted on every pong, whether or not [authoritativeTrackId] is populated. Consumers should
+     * check [authoritativeTrackId].isNotEmpty() before trusting the playback fields — older servers
+     * leave them at their zero defaults.
+     */
+    data class Pong(
+        val authoritativeTrackId: String,
+        val authoritativeIsPlaying: Boolean,
+        val authoritativePosition: Long,
+        val authoritativeServerTime: Long,
+    ) : ListenTogetherEvent
+
+    /**
      * The socket is down. [willRetry] false means this client has given up and the user has to
      * rejoin by hand — the retry budget is spent, or the server refused this client outright.
      */
@@ -338,6 +352,15 @@ class ListenTogetherClient(
                     Logger.i(TAG, "Server clock calibrated")
                     _events.emit(ListenTogetherEvent.ClockReady)
                 }
+                // Always emit the pong so the bridge can use authoritative fields when present.
+                _events.emit(
+                    ListenTogetherEvent.Pong(
+                        authoritativeTrackId = pong.authoritativeTrackId,
+                        authoritativeIsPlaying = pong.authoritativeIsPlaying,
+                        authoritativePosition = pong.authoritativePosition,
+                        authoritativeServerTime = pong.authoritativeServerTime,
+                    ),
+                )
                 return
             }
 
@@ -349,8 +372,9 @@ class ListenTogetherClient(
             MessageTypes.ERROR -> {
                 val error = payload as? ErrorPayload
                 Logger.w(TAG, "Server error: ${error?.code} ${error?.message}")
-                // `error?.code in set` would not compile — Set<String>.contains takes a non-null
-                // String, and a null code is not a rejection anyway.
+                if (error != null && error.code in setOf("session_expired", "session_not_found", "room_not_found", "room_closed", "not_in_room")) {
+                    sessionToken = null
+                }
                 if (error != null && error.code in NON_RECOVERABLE_ERROR_CODES) {
                     Logger.e(TAG, "Server rejected this client (${error.code}) — not retrying")
                     fatal = true
@@ -361,6 +385,10 @@ class ListenTogetherClient(
             MessageTypes.KICKED -> sessionToken = null
         }
         _events.emit(ListenTogetherEvent.Message(type, payload))
+    }
+
+    fun clearSessionToken() {
+        sessionToken = null
     }
 
     /**

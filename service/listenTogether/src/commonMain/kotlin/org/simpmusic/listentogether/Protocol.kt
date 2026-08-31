@@ -336,6 +336,21 @@ data class PongPayload(
     @ProtoNumber(2) val serverReceiveTime: Long = 0L,
     @ProtoNumber(3) val serverSendTime: Long = 0L,
     @ProtoNumber(4) val sequence: Long = 0L,
+    /**
+     * Optional: server-authoritative playback state at the time the pong was sent.
+     *
+     * These fields are zero/empty on unmodified metroserver deployments. When a server that has
+     * been updated to populate them is deployed, the client can use them for a more accurate
+     * drift correction than relying only on the timestamp of the last explicit action.
+     *
+     * The position is in milliseconds. [authoritativeServerTime] is the server wall-clock time
+     * at which [authoritativePosition] was accurate — i.e. `lastActionServerTime` in the room.
+     * Pair it with [ServerClock.positionAt] to advance it to "now".
+     */
+    @ProtoNumber(5) val authoritativeTrackId: String = "",
+    @ProtoNumber(6) val authoritativeIsPlaying: Boolean = false,
+    @ProtoNumber(7) val authoritativePosition: Long = 0L,
+    @ProtoNumber(8) val authoritativeServerTime: Long = 0L,
 )
 
 @Serializable
@@ -398,4 +413,18 @@ data class ServerCapabilities(
     @ProtoNumber(1) val supportsProtobuf: Boolean = false,
     @ProtoNumber(2) val supportsCompression: Boolean = false,
     @ProtoNumber(3) val serverVersion: String = "",
+)
+
+@Serializable
+data class ChatMessagePayload(
+    @ProtoNumber(1) val id: String = "",
+    @ProtoNumber(2) val senderId: String = "",
+    @ProtoNumber(3) val senderName: String = "",
+    @ProtoNumber(4) val senderAvatar: String = "",
+    @ProtoNumber(5) val text: String = "",
+    @ProtoNumber(6) val timestamp: Long = 0L,
+    @ProtoNumber(7) val replyToId: String = "",
+    @ProtoNumber(8) val replyToText: String = "",
+    @ProtoNumber(9) val replyToSenderName: String = "",
+    @ProtoNumber(10) val reactions: List<String> = emptyList(),
 )

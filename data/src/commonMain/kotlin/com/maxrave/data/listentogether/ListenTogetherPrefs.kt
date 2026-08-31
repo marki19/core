@@ -15,6 +15,13 @@ object ListenTogetherPrefs {
     const val FOLLOW_HOST_VOLUME = "lt_follow_host_volume"
     const val BLOCKLIST = "lt_blocklist"
 
+    // Jam permissions — host controls what members can do inside a room.
+    const val JAM_ALLOW_QUEUE = "lt_jam_allow_queue"
+    const val JAM_ALLOW_REORDER = "lt_jam_allow_reorder"
+    const val JAM_ALLOW_PLAY_DIRECT = "lt_jam_allow_play_direct"
+    const val JAM_ALLOW_SEEK = "lt_jam_allow_seek"
+    const val JAM_ALLOW_PLAY_PAUSE = "lt_jam_allow_play_pause"
+
     const val TRUE = "TRUE"
     const val FALSE = "FALSE"
 

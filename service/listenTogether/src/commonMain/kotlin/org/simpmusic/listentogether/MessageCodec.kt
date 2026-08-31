@@ -10,6 +10,7 @@ import okio.Buffer
 import okio.GzipSink
 import okio.GzipSource
 import okio.buffer
+import okio.use
 
 /**
  * Turns a payload into the bytes that go on the socket, and back.
@@ -113,6 +114,7 @@ internal class MessageCodec(
             MessageTypes.SUGGESTION_RECEIVED -> decode(SuggestionReceivedPayload.serializer(), payloadBytes)
             MessageTypes.SUGGESTION_APPROVED -> decode(SuggestionApprovedPayload.serializer(), payloadBytes)
             MessageTypes.SUGGESTION_REJECTED -> decode(SuggestionRejectedPayload.serializer(), payloadBytes)
+            MessageTypes.CHAT -> decode(ChatMessagePayload.serializer(), payloadBytes)
 
             MessageTypes.SERVER_CAPABILITIES -> decode(ServerCapabilities.serializer(), payloadBytes)
 
@@ -136,6 +138,7 @@ internal class MessageCodec(
             is RejectSuggestionPayload -> proto.encodeToByteArray(RejectSuggestionPayload.serializer(), payload)
             is ReconnectPayload -> proto.encodeToByteArray(ReconnectPayload.serializer(), payload)
             is ClientCapabilities -> proto.encodeToByteArray(ClientCapabilities.serializer(), payload)
+            is ChatMessagePayload -> proto.encodeToByteArray(ChatMessagePayload.serializer(), payload)
             else -> ByteArray(0)
         }
 

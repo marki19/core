@@ -26,6 +26,7 @@ data class RoomMember(
     val username: String,
     val isHost: Boolean,
     val isConnected: Boolean,
+    val avatarUrl: String? = null,
     /** True while this member has not reported the current track as ready. */
     val isBuffering: Boolean = false,
 )
@@ -33,6 +34,7 @@ data class RoomMember(
 data class RoomJoinRequest(
     val userId: String,
     val username: String,
+    val avatarUrl: String? = null,
 )
 
 data class RoomTrack(
@@ -50,6 +52,27 @@ data class RoomSuggestion(
     val track: RoomTrack,
 )
 
+data class JamPermissions(
+    val allowQueue: Boolean = true,
+    val allowReorder: Boolean = false,
+    val allowPlayDirect: Boolean = false,
+    val allowSeek: Boolean = false,
+    val allowPlayPause: Boolean = false,
+)
+
+data class JamChatMessage(
+    val id: String,
+    val senderId: String,
+    val senderName: String,
+    val senderAvatar: String? = null,
+    val text: String,
+    val timestamp: Long,
+    val replyToId: String? = null,
+    val replyToText: String? = null,
+    val replyToSenderName: String? = null,
+    val reactions: List<String> = emptyList(),
+)
+
 data class ListenTogetherRoom(
     val connection: RoomConnection = RoomConnection.Disconnected,
     val roomCode: String? = null,
@@ -62,6 +85,8 @@ data class ListenTogetherRoom(
     val queue: List<RoomTrack> = emptyList(),
     val isPlaying: Boolean = false,
     val position: Long = 0L,
+    val permissions: JamPermissions = JamPermissions(),
+    val chatMessages: List<JamChatMessage> = emptyList(),
     /** Non-empty while the room is held at the buffer barrier. */
     val waitingFor: List<String> = emptyList(),
     /** The code we asked to join and have not heard back about. */
