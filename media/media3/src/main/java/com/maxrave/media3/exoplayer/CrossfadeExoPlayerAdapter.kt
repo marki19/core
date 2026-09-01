@@ -1614,6 +1614,10 @@ internal class CrossfadeExoPlayerAdapter(
 
                         Player.STATE_BUFFERING -> {
                             // Playback is stalled waiting for data — report buffering
+                            if (!cachedIsLoading && player == currentPlayer) {
+                                cachedIsLoading = true
+                                listeners.forEach { it.onIsLoadingChanged(true) }
+                            }
                         }
                     }
                 }
@@ -1710,17 +1714,8 @@ internal class CrossfadeExoPlayerAdapter(
 
                 override fun onIsLoadingChanged(isLoading: Boolean) {
                     // ExoPlayer reports isLoading=true during normal background buffer refill,
-                    // not just when playback is stalled. Only propagate loading=true when
-                    // playback is actually stalled (STATE_BUFFERING) AND the player intends
-                    // to play. Ignore buffering events while paused to avoid showing
-                    // a loading spinner when the user has explicitly paused.
-                    val isPlaybackStalled = isLoading && player.playbackState == Player.STATE_BUFFERING && player.playWhenReady
-                    val isCurrentPlayer = player == currentPlayer
-                    Logger.d(TAG, "onIsLoadingChanged: isLoading=$isLoading, isPlaybackStalled=$isPlaybackStalled, isCurrentPlayer=$isCurrentPlayer")
-                    if (cachedIsLoading != isPlaybackStalled && isCurrentPlayer) {
-                        cachedIsLoading = isPlaybackStalled
-                        listeners.forEach { it.onIsLoadingChanged(isPlaybackStalled) }
-                    }
+                    // not just when playback is stalled. 
+                    // Stalled state (buffering spinner) is now strictly handled by onPlaybackStateChanged (STATE_BUFFERING).
                 }
 
                 override fun onTracksChanged(tracks: Tracks) {

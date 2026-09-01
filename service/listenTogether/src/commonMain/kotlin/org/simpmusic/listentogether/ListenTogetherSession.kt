@@ -347,12 +347,6 @@ class ListenTogetherSession(
                 queue = updatedQueue,
                 queueTitle = formatJamPermissions(_state.value.permissions),
             )
-            sendPlaybackAction(
-                action = PlaybackActions.PLAY,
-                trackId = "",
-                position = 0L,
-                trackInfo = null,
-            )
         }
 
     fun play() = launch {
@@ -750,11 +744,12 @@ class ListenTogetherSession(
                             when (p.action) {
                                 PlaybackActions.PAUSE -> false
                                 PlaybackActions.PLAY -> true
+                                PlaybackActions.CHANGE_TRACK -> false
                                 else -> it.isPlaying
                             },
                         position = if (isQueueAction) it.position else p.position,
                         queue = if (isQueueAction && p.queue.isNotEmpty()) p.queue else (if (p.action == PlaybackActions.QUEUE_CLEAR) emptyList() else p.queue.ifEmpty { it.queue }),
-                        lastActionServerTime = p.capturedAtServerTime,
+                        lastActionServerTime = if (isQueueAction) it.lastActionServerTime else p.capturedAtServerTime,
                         permissions = parsedPerms ?: it.permissions,
                     )
                 }

@@ -90,18 +90,20 @@ class ListenTogetherPlaybackBridge(
         if (started) return
         started = true
         Logger.i(TAG, "Playback bridge started")
-        scope.launch { suppressCrossfadeWhileInRoom() }
-        scope.launch { watchRoomPlayback() }
-        scope.launch { resyncGuestOnResume() }
-        scope.launch { periodicDriftCorrection() }
-        scope.launch { pongDriftCorrection() }
-        scope.launch { publishCurrentStateOnJoin() }
-        scope.launch { publishStateWhenSomeoneArrives() }
-        scope.launch { publishQueueAsHost() }
-        scope.launch { publishTrackChangesAsHost() }
-        scope.launch { publishPlayPauseAsHost() }
-        scope.launch { publishSeeksAsHost() }
-        scope.launch { answerBufferBarrier() }
+        scope.launch {
+            launch { suppressCrossfadeWhileInRoom() }
+            launch { watchRoomPlayback() }
+            launch { resyncGuestOnResume() }
+            launch { periodicDriftCorrection() }
+            launch { pongDriftCorrection() }
+            launch { publishCurrentStateOnJoin() }
+            launch { publishQueueAsHost() }
+            launch { publishTrackChangesAsHost() }
+            launch { publishPlayPauseAsHost() }
+            launch { publishSeeksAsHost() }
+            launch { answerBufferBarrier() }
+            launch { handleAutoAdvanceAsHost() }
+        }
     }
 
     /**
@@ -214,7 +216,7 @@ class ListenTogetherPlaybackBridge(
     private suspend fun pongDriftCorrection() {
         session.authoritativePong.collect { pong ->
             val room = repository.room.value
-            if (!room.inRoom || room.isHost || applyingRemote) return@collect
+            if (!room.inRoom || !room.isHost || applyingRemote) return@collect
             if (!pong.authoritativeIsPlaying) return@collect
             // Verify the pong matches the track everyone is on — a stale pong during a track
             // transition should not seek the guest into the wrong position.
@@ -287,7 +289,7 @@ class ListenTogetherPlaybackBridge(
                         val alreadyPlayingLocally = handler.nowPlaying.value?.mediaId == track.id
                         // When joining a room already playing mid-song, start playback.
                         // On new track transitions, wait for the host's PLAY command so everyone starts in sync.
-                        val shouldPlay = if (isInitialJoin) isPlaying else false
+                        val shouldPlay = if (isHost) true else (if (isInitialJoin) isPlaying else false)
                         if (!alreadyPlayingLocally) {
                             playTrack(track, keepPosition = startAt, playWhenReady = shouldPlay)
                         }
@@ -299,8 +301,26 @@ class ListenTogetherPlaybackBridge(
                         // Apply play/pause transport or remote seek to guest.
                         applyTransport(isPlaying, position)
                     } else {
-                        // On host: apply remote play/pause if a member with permission paused or resumed the room
+                        // On host: apply remote play/pause if a member with permission paused or
+                        // resumed the room, and apply a remote seek if a member with seek permission
+                        // dragged the scrubber. Without applying the seek here the host would keep
+                        // playing from wherever it was and would only pick up the correction after the
+                        // next pongDriftCorrection tick (≤10 s) — during which it can finish the
+                        // current track and auto-advance before the backward seek ever lands.
+                        //
+                        // applyingRemote is already true at this point, so publishSeeksAsHost
+                        // (which guards on applyingRemote) will not echo this seek back to the server.
                         withContext(Dispatchers.Main) {
+                            // Seek first so the play/pause command lands at the right position.
+                            val corrected = session.positionAt(position, isPlaying)
+                            val isBuffering = handler.simpleMediaState.value is SimpleMediaState.Buffering
+                            if (!isBuffering && abs(handler.player.currentPosition - corrected) > SEEK_TOLERANCE_MS) {
+                                Logger.i(
+                                    TAG,
+                                    "Host applying remote seek to $corrected (room pos=$position, local=${handler.player.currentPosition})",
+                                )
+                                handler.player.seekTo(corrected)
+                            }
                             if (isPlaying && !handler.player.playWhenReady) {
                                 handler.player.play()
                             } else if (!isPlaying && handler.player.playWhenReady) {
@@ -325,8 +345,10 @@ class ListenTogetherPlaybackBridge(
         val corrected = session.positionAt(position, isPlaying)
         // A small drift is normal and seeking on every tick would stutter; only a real gap is worth
         // a seek, which is also why the host publishes position with each command.
-        // Only apply drift seek if the player is actively rendering playback (not buffering at the start of a song).
-        if (handler.player.isPlaying && abs(handler.player.currentPosition - corrected) > SEEK_TOLERANCE_MS) {
+        // Only apply drift seek if the player is actively rendering playback or paused/ended
+        // (not buffering at the start of a song).
+        val isBuffering = handler.simpleMediaState.value is SimpleMediaState.Buffering
+        if (!isBuffering && abs(handler.player.currentPosition - corrected) > SEEK_TOLERANCE_MS) {
             handler.player.seekTo(corrected)
         }
         // playWhenReady, not isPlaying: a track that is still buffering reports isPlaying=false
@@ -452,22 +474,6 @@ class ListenTogetherPlaybackBridge(
             .collect { isHosting -> if (isHosting) publishSnapshot() }
     }
 
-    /**
-     * Re-publishes for a guest who arrives later.
-     *
-     * The server keeps the room's last known state, but only what the host has told it; a guest
-     * approved before the host's first command would otherwise join an empty room.
-     */
-    private suspend fun publishStateWhenSomeoneArrives() {
-        repository.room
-            .map { it.members.size }
-            .distinctUntilChanged()
-            .collect { count ->
-                val state = repository.room.value
-                if (state.inRoom && state.isHost && count > 1) publishSnapshot()
-            }
-    }
-
     /** Republishes the queue whenever the host's own queue changes. */
     private suspend fun publishQueueAsHost() {
         handler.queueData
@@ -526,6 +532,53 @@ class ListenTogetherPlaybackBridge(
                 val canControl = state.isHost || state.permissions.allowPlayDirect
                 if (!state.inRoom || !canControl || applyingRemote) return@collect
                 if (item.mediaId == lastPublishedTrackId) return@collect
+
+                // Guard against the host navigating backward into local ExoPlayer history.
+                //
+                // The room queue contains only UPCOMING tracks; there is no concept of "previous"
+                // in the room protocol. When the host presses Previous at ≤ 3 s, the local
+                // ExoPlayer jumps to the previous media item in its personal timeline — a track
+                // that guests and the server know nothing about.
+                //
+                // If the new track is neither the current room track nor anywhere in the upcoming
+                // room queue, treat it as an out-of-room backwards navigation:
+                //   1. Restore the player to the current room track at 0:00 (locally).
+                //   2. Publish SEEK(0) so everyone restarts the current song in sync.
+                // This preserves the "restart current song" semantic of Previous while keeping
+                // the room in a coherent state.
+                val roomState = repository.room.value
+                val currentRoomTrackId = roomState.currentTrack?.id
+                val isInRoomQueue = roomState.queue.any { it.id == item.mediaId }
+                val isCurrentRoomTrack = item.mediaId == currentRoomTrackId
+
+                if (!isCurrentRoomTrack && !isInRoomQueue && currentRoomTrackId != null) {
+                    Logger.i(
+                        TAG,
+                        "Host navigated to out-of-room track ${item.mediaId} (not in queue, " +
+                            "current room track=$currentRoomTrackId) — restoring room track and publishing SEEK(0)",
+                    )
+                    // Re-load the current room track. applyingRemote is NOT set here — we are the
+                    // host acting on our own, so the restore must go through normally. We set
+                    // lastPublishedTrackId/lastAppliedTrackId back to the room track so that when
+                    // playTrack fires nowPlaying again it is recognised as no-change.
+                    val roomTrack = roomState.currentTrack
+                    if (roomTrack != null) {
+                        lastPublishedTrackId = roomTrack.id
+                        lastAppliedTrackId = roomTrack.id
+                        // Read playWhenReady on Main — the player must not be touched off that thread.
+                        val shouldPlay = withContext(Dispatchers.Main) { handler.player.playWhenReady }
+                        playTrack(roomTrack, keepPosition = 0L, playWhenReady = shouldPlay)
+                    }
+                    // Tell the room to restart the current song from 0.
+                    session.sendPlaybackAction(
+                        action = PlaybackActions.SEEK,
+                        trackId = "",
+                        position = 0L,
+                        trackInfo = null,
+                    )
+                    return@collect
+                }
+
                 lastPublishedTrackId = item.mediaId
                 lastAppliedTrackId = item.mediaId
                 Logger.i(TAG, "Host publishing track change: ${item.mediaId}")
@@ -541,6 +594,7 @@ class ListenTogetherPlaybackBridge(
                 // Note: Do NOT send premature PLAY here. Once the host finishes buffering and actually
                 // starts playing audio (isPlaying=true), publishPlayPauseAsHost will send PLAY with 0L.
                 // This ensures all members wait for the host to finish buffering and everyone starts together!
+                lastPublishedIsPlaying = false
             }
     }
 
@@ -648,6 +702,28 @@ class ListenTogetherPlaybackBridge(
                 session.reportBufferReady(trackId)
             }
         }.collect()
+    }
+
+    private suspend fun handleAutoAdvanceAsHost() {
+        handler.simpleMediaState
+            .collect { mediaState ->
+                if (mediaState is SimpleMediaState.Ended) {
+                    val state = repository.room.value
+                    if (state.inRoom && state.isHost) {
+                        val currentQueue = state.queue
+                        if (currentQueue.isNotEmpty()) {
+                            val nextTrack = currentQueue.first()
+                            repository.playQueuedTrack(0, nextTrack)
+                        } else {
+                            // Queue is empty. We should pause the room to indicate playback finished.
+                            withContext(Dispatchers.Main) {
+                                handler.player.pause()
+                                handler.player.seekTo(0L)
+                            }
+                        }
+                    }
+                }
+            }
     }
 
     private fun Track.toTrackInfo(): TrackInfo =

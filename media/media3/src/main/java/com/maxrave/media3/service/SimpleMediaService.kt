@@ -20,6 +20,7 @@ import com.google.common.util.concurrent.MoreExecutors
 import com.maxrave.common.MEDIA_NOTIFICATION
 import com.maxrave.domain.manager.DataStoreManager
 import com.maxrave.domain.mediaservice.handler.MediaPlayerHandler
+import com.maxrave.domain.repository.ListenTogetherRepository
 import com.maxrave.logger.Logger
 import com.maxrave.media3.R
 import com.maxrave.media3.extension.toCommandButton
@@ -48,6 +49,7 @@ internal class SimpleMediaService :
 
     private val simpleMediaServiceHandler: MediaPlayerHandler by inject<MediaPlayerHandler>()
     private val dataStoreManager: DataStoreManager by inject<DataStoreManager>()
+    private val listenTogetherRepository: ListenTogetherRepository by inject<ListenTogetherRepository>()
 
     private val binder = MusicBinder()
 
@@ -140,7 +142,10 @@ internal class SimpleMediaService :
         // the OS cannot kill it while paused. We reuse Media3's own notification machinery
         // (DefaultMediaNotificationProvider, notification ID 200) — no second
         // PlayerNotificationManager or duplicate notification is needed.
-        super.onUpdateNotification(session, keepServiceAlive || startInForegroundRequired)
+        // We also pin the service when the user is in a Jam room to prevent the WebSocket
+        // from being killed due to process suspension while paused.
+        val inRoom = listenTogetherRepository.room.value.inRoom
+        super.onUpdateNotification(session, keepServiceAlive || inRoom || startInForegroundRequired)
     }
 
     @UnstableApi

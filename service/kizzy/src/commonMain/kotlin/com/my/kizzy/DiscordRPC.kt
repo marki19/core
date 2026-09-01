@@ -35,7 +35,7 @@ class DiscordRPC(
             buttons =
                 listOf(
                     "Listen on SimpMusic" to "https://simpmusic.org/app/watch?v=${song.videoId}",
-                    "Visit SimpMusic" to "https://github.com/maxrave-dev/SimpMusic",
+                    "Visit SimpMusic" to "https://github.com/marki19/SimpMusic-with-Jam-features",
                 ),
             type = Type.LISTENING,
             since = currentTime,
