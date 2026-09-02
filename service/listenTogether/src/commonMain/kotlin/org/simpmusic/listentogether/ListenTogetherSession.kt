@@ -14,6 +14,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.coroutines.CoroutineContext
 import kotlin.time.Duration.Companion.seconds
@@ -134,6 +136,12 @@ class ListenTogetherSession(
     val authoritativePong: SharedFlow<ListenTogetherEvent.Pong> = _authoritativePong.asSharedFlow()
 
     private var pump: Job? = null
+
+    /**
+     * A track change is two protocol frames: CHANGE_TRACK clears the server's playing flag, then
+     * PLAY or PAUSE restores the intent. Keep that pair adjacent to every other playback frame.
+     */
+    private val playbackActionMutex = Mutex()
 
     /** Host-side conveniences from settings; both default off, matching the design's toggles. */
     var autoApproveJoins: Boolean = false
@@ -314,17 +322,11 @@ class ListenTogetherSession(
 
     fun playTrackDirect(track: TrackInfo) =
         launch {
-            sendPlaybackAction(
-                action = PlaybackActions.CHANGE_TRACK,
+            sendTrackChangeAndRestoreIntent(
                 trackId = track.id,
                 position = 0L,
                 trackInfo = track,
-            )
-            sendPlaybackAction(
-                action = PlaybackActions.PLAY,
-                trackId = "",
-                position = 0L,
-                trackInfo = null,
+                shouldPlay = true,
             )
         }
 
@@ -338,14 +340,20 @@ class ListenTogetherSession(
                 } else {
                     currentQueue.filterNot { it.id == track.id }
                 }
+            // Capture the room's playback intent before the track change. The server's CHANGE_TRACK
+            // handler resets isPlaying=false, so we must re-publish the intent on the same frame.
+            // This is what makes auto-advance (and manual NEXT) actually resume playback: a track
+            // change without a follow-up PLAY/PAUSE leaves the new track permanently paused on
+            // every client, including the host.
+            val wasPlaying = _state.value.isPlaying
             _state.update { it.copy(queue = updatedQueue) }
-            sendPlaybackAction(
-                action = PlaybackActions.CHANGE_TRACK,
+            sendTrackChangeAndRestoreIntent(
                 trackId = track.id,
                 position = 0L,
                 trackInfo = track,
                 queue = updatedQueue,
                 queueTitle = formatJamPermissions(_state.value.permissions),
+                shouldPlay = wasPlaying,
             )
         }
 
@@ -401,8 +409,7 @@ class ListenTogetherSession(
         queue: List<TrackInfo> = emptyList(),
         queueTitle: String = "",
     ) = launch {
-        client.send(
-            MessageTypes.PLAYBACK_ACTION,
+        sendPlaybackActionFrame(
             PlaybackActionPayload(
                 action = action,
                 trackId = trackId,
@@ -419,6 +426,72 @@ class ListenTogetherSession(
         )
     }
 
+    /**
+     * Publishes a track transition as one ordered transaction.
+     *
+     * The server clears `isPlaying` for CHANGE_TRACK, even when the outgoing song was running. The
+     * follow-up transport action is therefore required for every transition — manual next, natural
+     * auto-advance, and a normal player timeline transition alike.
+     */
+    fun sendTrackChange(
+        trackId: String,
+        position: Long,
+        trackInfo: TrackInfo,
+        queue: List<TrackInfo> = emptyList(),
+        queueTitle: String = "",
+        shouldPlay: Boolean,
+    ) = launch {
+        sendTrackChangeAndRestoreIntent(
+            trackId = trackId,
+            position = position,
+            trackInfo = trackInfo,
+            queue = queue,
+            queueTitle = queueTitle,
+            shouldPlay = shouldPlay,
+        )
+    }
+
+    private suspend fun sendTrackChangeAndRestoreIntent(
+        trackId: String,
+        position: Long,
+        trackInfo: TrackInfo,
+        queue: List<TrackInfo> = emptyList(),
+        queueTitle: String = "",
+        shouldPlay: Boolean,
+    ) {
+        playbackActionMutex.withLock {
+            val changed =
+                client.send(
+                    MessageTypes.PLAYBACK_ACTION,
+                    PlaybackActionPayload(
+                        action = PlaybackActions.CHANGE_TRACK,
+                        trackId = trackId,
+                        position = position,
+                        trackInfo = trackInfo,
+                        queue = queue,
+                        queueTitle = queueTitle,
+                        capturedAtServerTime = client.serverNow() ?: 0L,
+                    ),
+                )
+            if (!changed) return
+
+            client.send(
+                MessageTypes.PLAYBACK_ACTION,
+                PlaybackActionPayload(
+                    action = if (shouldPlay) PlaybackActions.PLAY else PlaybackActions.PAUSE,
+                    // Empty lets the server use the track it just committed, avoiding stale_track.
+                    trackId = "",
+                    position = position,
+                    trackInfo = null,
+                    capturedAtServerTime = client.serverNow() ?: 0L,
+                ),
+            )
+        }
+    }
+
+    private suspend fun sendPlaybackActionFrame(payload: PlaybackActionPayload): Boolean =
+        playbackActionMutex.withLock { client.send(MessageTypes.PLAYBACK_ACTION, payload) }
+
     /** Publishes the whole queue. Host only; guests take the host's order verbatim. */
     fun sendQueue(
         tracks: List<TrackInfo>,
@@ -426,8 +499,7 @@ class ListenTogetherSession(
     ) = launch {
         _state.update { it.copy(queue = tracks) }
         val title = queueTitle.ifBlank { formatJamPermissions(_state.value.permissions) }
-        client.send(
-            MessageTypes.PLAYBACK_ACTION,
+        sendPlaybackActionFrame(
             PlaybackActionPayload(
                 action = PlaybackActions.SYNC_QUEUE,
                 queue = tracks,
@@ -440,8 +512,7 @@ class ListenTogetherSession(
     fun updateJamPermissions(perms: JamPermissionsState) = launch {
         _state.update { it.copy(permissions = perms) }
         if (_state.value.inRoom && _state.value.isHost) {
-            client.send(
-                MessageTypes.PLAYBACK_ACTION,
+            sendPlaybackActionFrame(
                 PlaybackActionPayload(
                     action = PlaybackActions.SYNC_QUEUE,
                     queue = _state.value.queue,
@@ -455,8 +526,7 @@ class ListenTogetherSession(
     fun addToQueue(track: TrackInfo) = launch {
         val currentQueue = _state.value.queue
         if (_state.value.isHost || _state.value.permissions.allowQueue) {
-            client.send(
-                MessageTypes.PLAYBACK_ACTION,
+            sendPlaybackActionFrame(
                 PlaybackActionPayload(
                     action = PlaybackActions.QUEUE_ADD,
                     trackInfo = track,
@@ -740,6 +810,10 @@ class ListenTogetherSession(
                             p.action == PlaybackActions.SYNC_QUEUE
                     it.copy(
                         currentTrack = newCurrentTrack,
+                        // CHANGE_TRACK is always a paused intermediate state on the server. The
+                        // following PLAY/PAUSE frame restores the captured intent. Keeping the old
+                        // value here collapses the later PLAY=true into no StateFlow change, so a
+                        // newly buffered track never receives the command that should start it.
                         isPlaying =
                             when (p.action) {
                                 PlaybackActions.PAUSE -> false

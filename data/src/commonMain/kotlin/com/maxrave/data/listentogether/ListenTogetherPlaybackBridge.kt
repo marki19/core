@@ -10,7 +10,6 @@ import com.maxrave.domain.mediaservice.handler.SimpleMediaState
 import com.maxrave.domain.repository.ListenTogetherRepository
 import com.maxrave.logger.Logger
 import kotlin.math.abs
-import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.TimeSource
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -28,10 +27,6 @@ import org.simpmusic.listentogether.ListenTogetherSession
 import org.simpmusic.listentogether.PlaybackActions
 import org.simpmusic.listentogether.TrackInfo
 
-private val PLAY_SETTLE_TIMEOUT = 2000.milliseconds
-
-/** Poll step for the settle wait; playWhenReady has no flow to collect. */
-private val PLAY_SETTLE_POLL = 50.milliseconds
 private const val TAG = "ListenTogetherBridge"
 
 /** What the guest reacts to. A data class so `distinctUntilChanged` compares every field. */
@@ -84,6 +79,14 @@ class ListenTogetherPlaybackBridge(
      * Needed because change_track always says "not playing" — see [watchRoomPlayback].
      */
     private var lastRoomPlaying = false
+
+    /**
+     * Monotonic time (ms) when the current track was first applied. Drift correction is disabled
+     * for the initial buffer window after a track change so a Member becoming READY ahead of the
+     * host does not start independently and then get snapped back. Combined with the buffer
+     * barrier this keeps every Member locked to the host's "play from 0:00" moment.
+     */
+    private var trackEpochMs: Long = 0L
 
     /** Idempotent: callers cannot know whether something else already started it. */
     fun start() {
@@ -176,6 +179,8 @@ class ListenTogetherPlaybackBridge(
      * - We are currently applying a remote command (`applyingRemote`) — avoid a race.
      * - We are the host — the host IS the authoritative source, correcting against yourself
      *   makes no sense and could fight with explicit seek publishes.
+     * - The current track epoch has not yet elapsed ([trackEpochMs]) — new-track initialization
+     *   sets its own authoritative position; drift correction is disabled until that settles.
      */
     private suspend fun periodicDriftCorrection() {
         while (true) {
@@ -183,6 +188,10 @@ class ListenTogetherPlaybackBridge(
             val room = repository.room.value
             if (!room.inRoom || !room.isPlaying || room.currentTrack == null) continue
             if (room.isHost || applyingRemote) continue
+
+            // Disable correction during the new-track epoch until it has elapsed.
+            val nowMs = PROCESS_START.elapsedNow().inWholeMilliseconds
+            if (nowMs - trackEpochMs < NEW_TRACK_EPOCH_MS) continue
 
             val authoritativePos = session.positionAt(room.position, room.isPlaying)
             val (localPos, localPlayWhenReady, isPlayingNow) = withContext(Dispatchers.Main) {
@@ -195,9 +204,9 @@ class ListenTogetherPlaybackBridge(
             if (drift > SEEK_TOLERANCE_MS) {
                 Logger.i(
                     TAG,
-                    "Drift correction: local=$localPos auth=$authoritativePos drift=${drift}ms — seeking",
+                    "Periodic drift correction: local=$localPos auth=$authoritativePos drift=${drift}ms — seeking",
                 )
-                withContext(Dispatchers.Main) { handler.player.seekTo(authoritativePos) }
+                withContext(Dispatchers.Main) { applyDriftCorrection(authoritativePos) }
             } else {
                 Logger.d(TAG, "Drift check: ${drift}ms — within tolerance, no correction needed")
             }
@@ -212,6 +221,8 @@ class ListenTogetherPlaybackBridge(
      * an authoritative position (only possible once the metroserver fork is updated to populate
      * those fields). On stock metroserver [session.authoritativePong] never emits — this is a
      * zero-overhead forward-compatible hook.
+     *
+     * Uses [applyDriftCorrection] so this path also participates in correction-stacking prevention.
      */
     private suspend fun pongDriftCorrection() {
         session.authoritativePong.collect { pong ->
@@ -221,6 +232,10 @@ class ListenTogetherPlaybackBridge(
             // Verify the pong matches the track everyone is on — a stale pong during a track
             // transition should not seek the guest into the wrong position.
             if (room.currentTrack?.id != pong.authoritativeTrackId) return@collect
+
+            // Disable correction during the new-track epoch.
+            val nowMs = PROCESS_START.elapsedNow().inWholeMilliseconds
+            if (nowMs - trackEpochMs < NEW_TRACK_EPOCH_MS) return@collect
 
             // Use the pong's own serverTime for a more precise correction than the last-action time.
             val authoritativePos = session.positionAt(
@@ -239,7 +254,7 @@ class ListenTogetherPlaybackBridge(
                     TAG,
                     "Pong drift correction: local=$localPos auth=$authoritativePos drift=${drift}ms — seeking",
                 )
-                withContext(Dispatchers.Main) { handler.player.seekTo(authoritativePos) }
+                withContext(Dispatchers.Main) { applyDriftCorrection(authoritativePos) }
             }
         }
     }
@@ -278,6 +293,10 @@ class ListenTogetherPlaybackBridge(
                         lastPublishedTrackId = track.id
                         lastPublishedIsPlaying = isPlaying
                         lastAppliedQueueIds = queueIds
+                        // Mark the start of a new track epoch. Drift correction is disabled for
+                        // [NEW_TRACK_EPOCH_MS] after this point so a Member that becomes READY
+                        // before the host does not start independently and then get snapped back.
+                        trackEpochMs = PROCESS_START.elapsedNow().inWholeMilliseconds
                         // If this is an ongoing track transition in the room, ALWAYS start at 0L (0:00).
                         // Only seek ahead if a guest is joining an already-playing room for the first time mid-song.
                         val startAt =
@@ -287,11 +306,21 @@ class ListenTogetherPlaybackBridge(
                                 0L
                             }
                         val alreadyPlayingLocally = handler.nowPlaying.value?.mediaId == track.id
-                        // When joining a room already playing mid-song, start playback.
-                        // On new track transitions, wait for the host's PLAY command so everyone starts in sync.
-                        val shouldPlay = if (isHost) true else (if (isInitialJoin) isPlaying else false)
+                        // On a track transition, wait for the server's follow-up PLAY/PAUSE frame
+                        // so every client starts from the same paused loading state. A first join
+                        // is different: start immediately when the room is already playing.
+                        val shouldPlay = if (isInitialJoin) isPlaying else false
                         if (!alreadyPlayingLocally) {
                             playTrack(track, keepPosition = startAt, playWhenReady = shouldPlay)
+                        } else if (!isInitialJoin) {
+                            // The host's native player may have already advanced to this item
+                            // before its CHANGE_TRACK echo returns. Stop it at the shared start
+                            // position; the following PLAY frame is the only command that may
+                            // resume it.
+                            withContext(Dispatchers.Main) {
+                                handler.player.pause()
+                                handler.player.seekTo(0L)
+                            }
                         }
                     } else if (queueChanged && track != null) {
                         lastAppliedQueueIds = queueIds
@@ -319,7 +348,7 @@ class ListenTogetherPlaybackBridge(
                                     TAG,
                                     "Host applying remote seek to $corrected (room pos=$position, local=${handler.player.currentPosition})",
                                 )
-                                handler.player.seekTo(corrected)
+                                applyDriftCorrection(corrected)
                             }
                             if (isPlaying && !handler.player.playWhenReady) {
                                 handler.player.play()
@@ -345,20 +374,37 @@ class ListenTogetherPlaybackBridge(
         val corrected = session.positionAt(position, isPlaying)
         // A small drift is normal and seeking on every tick would stutter; only a real gap is worth
         // a seek, which is also why the host publishes position with each command.
-        // Only apply drift seek if the player is actively rendering playback or paused/ended
-        // (not buffering at the start of a song).
-        val isBuffering = handler.simpleMediaState.value is SimpleMediaState.Buffering
-        if (!isBuffering && abs(handler.player.currentPosition - corrected) > SEEK_TOLERANCE_MS) {
-            handler.player.seekTo(corrected)
+        if (abs(handler.player.currentPosition - corrected) > SEEK_TOLERANCE_MS) {
+            applyDriftCorrection(corrected)
         }
         // playWhenReady, not isPlaying: a track that is still buffering reports isPlaying=false
         // while already committed to playing, so comparing against it re-issues play() every tick
         // and, worse, lets a stale pause land on a track that was about to start.
+        // NOTE: the buffering check is intentionally omitted here. Both SEEK and PLAY must apply
+        // immediately so their intent is not lost. ExoPlayer queues seeks correctly during buffering,
+        // and calling play() while buffering sets playWhenReady=true so playback starts as soon as
+        // the buffer fills — the previous check (which skipped play() while buffering) caused the
+        // PLAY intent to be dropped on track transitions: the command arrived during buffer fill,
+        // was skipped, and nothing ever retried it, leaving every new track permanently paused.
         if (isPlaying && !handler.player.playWhenReady) {
             handler.player.play()
         } else if (!isPlaying && handler.player.playWhenReady) {
             handler.player.pause()
         }
+    }
+
+    /**
+     * Applies an authoritative position correction without delaying room-event collection.
+     *
+     * A seek itself is asynchronous in both players. Waiting for it here made the StateFlow
+     * collector unavailable for up to two seconds; a CHANGE_TRACK then PLAY pair could conflate
+     * into one "new track, playing" snapshot, after which the player loaded it paused and never
+     * observed the PLAY. Issuing the seek is sufficient — subsequent state frames must be handled
+     * immediately.
+     */
+    private suspend fun applyDriftCorrection(targetPositionMs: Long) {
+        Logger.i(TAG, "Drift correction: seeking to $targetPositionMs")
+        handler.player.seekTo(targetPositionMs)
     }
 
     /**
@@ -504,21 +550,13 @@ class ListenTogetherPlaybackBridge(
             withContext(Dispatchers.Main) {
                 handler.player.currentPosition to handler.player.playWhenReady
             }
-        session.sendPlaybackAction(
-            action = PlaybackActions.CHANGE_TRACK,
+        session.sendTrackChange(
             trackId = item.mediaId,
             position = position,
             trackInfo = item.toTrackInfo(),
             queue = data?.listTracks.orEmpty().map { it.toTrackInfo() },
             queueTitle = data?.playlistName.orEmpty(),
-        )
-        // A second command, because change_track alone does not say whether it is running —
-        // the server explicitly sets IsPlaying=false on a track change.
-        session.sendPlaybackAction(
-            action = if (playWhenReady) PlaybackActions.PLAY else PlaybackActions.PAUSE,
-            trackId = "",
-            position = position,
-            trackInfo = null,
+            shouldPlay = playWhenReady,
         )
         Logger.i(TAG, "Published current state to the room: ${item.mediaId}")
     }
@@ -581,20 +619,20 @@ class ListenTogetherPlaybackBridge(
 
                 lastPublishedTrackId = item.mediaId
                 lastAppliedTrackId = item.mediaId
+                // The now-playing item can change while it is buffering; playWhenReady is the
+                // transport intent, whereas isPlaying is false during that normal loading gap.
+                val shouldPlay = withContext(Dispatchers.Main) { handler.player.playWhenReady }
                 Logger.i(TAG, "Host publishing track change: ${item.mediaId}")
                 val remainingQueue = repository.room.value.queue.filterNot { it.id == item.mediaId }
-                session.sendPlaybackAction(
-                    action = PlaybackActions.CHANGE_TRACK,
+                session.sendTrackChange(
                     trackId = item.mediaId,
                     position = 0L,
                     trackInfo = item.toTrackInfo(),
                     queue = remainingQueue.map { it.toTrackInfo() },
                     queueTitle = "",
+                    shouldPlay = shouldPlay,
                 )
-                // Note: Do NOT send premature PLAY here. Once the host finishes buffering and actually
-                // starts playing audio (isPlaying=true), publishPlayPauseAsHost will send PLAY with 0L.
-                // This ensures all members wait for the host to finish buffering and everyone starts together!
-                lastPublishedIsPlaying = false
+                lastPublishedIsPlaying = shouldPlay
             }
     }
 
@@ -714,6 +752,8 @@ class ListenTogetherPlaybackBridge(
                         if (currentQueue.isNotEmpty()) {
                             val nextTrack = currentQueue.first()
                             repository.playQueuedTrack(0, nextTrack)
+                            // playQueuedTrack now sends CHANGE_TRACK + PLAY/PAUSE itself,
+                            // so the new track resumes in the same state as the previous one.
                         } else {
                             // Queue is empty. We should pause the room to indicate playback finished.
                             withContext(Dispatchers.Main) {
@@ -773,7 +813,6 @@ class ListenTogetherPlaybackBridge(
          */
         const val SEEK_DETECT_MS = 2_500L
         const val READY_BUFFER_PERCENT = 5
-        val BUFFER_READY_TIMEOUT = 10000.milliseconds
 
         /**
          * How often the background drift-correction loop wakes to compare the local position
@@ -787,5 +826,20 @@ class ListenTogetherPlaybackBridge(
          * [SEEK_TOLERANCE_MS], so a passing 10 s tick with 5 ms drift is a no-op.
          */
         const val DRIFT_CHECK_INTERVAL_MS = 10_000L
+
+        /**
+         * After a new track is applied to the local player, drift correction is suppressed for
+         * this many milliseconds so the initial buffer/READY window does not cause the Member to
+         * chase the host's moving position. A Member that finishes buffering before the host will
+         * be paused by the buffer barrier anyway, but on a single-member room or a flaky network
+         * the barrier does not block, and without this guard the periodic drift loop would
+         * immediately try to seek the Member from 0:00 to wherever the host is now.
+         *
+         * The duration is intentionally short — long enough to let a typical local buffer settle
+         * (≤ 500 ms for an audio track) but short enough that legitimate drift correction resumes
+         * quickly. 3 s is the budget for the worst case: a 1 MB stream taking 1-2 s to load, plus
+         * 1 s of headroom.
+         */
+        const val NEW_TRACK_EPOCH_MS = 3_000L
     }
 }
