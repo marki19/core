@@ -1,0 +1,285 @@
+package com.maxrave.data.listentogether
+
+import com.maxrave.domain.data.model.listentogether.ListenTogetherRoom
+import com.maxrave.domain.data.model.listentogether.RoomConnection
+import com.maxrave.domain.data.model.listentogether.RoomJoinRequest
+import com.maxrave.domain.data.model.listentogether.RoomMember
+import com.maxrave.domain.data.model.listentogether.RoomSuggestion
+import com.maxrave.domain.data.model.listentogether.RoomTrack
+import com.maxrave.domain.repository.ListenTogetherRepository
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.launch
+import org.simpmusic.listentogether.ConnectionState
+import org.simpmusic.listentogether.ListenTogetherSession
+import org.simpmusic.listentogether.ListenTogetherState
+import org.simpmusic.listentogether.PendingJoin
+import org.simpmusic.listentogether.PendingSuggestion
+import org.simpmusic.listentogether.TrackInfo
+
+/**
+ * The only place in the app that knows the Listen Together protocol exists.
+ *
+ * Everything above talks to [ListenTogetherRepository] in domain types; the protocol types stay
+ * behind this boundary because they are not ours to change — they mirror Metrolist's `.proto`, and
+ * a renamed field there is a client that cannot join a room.
+ *
+ * The [networkMonitor] watches for transport-type changes (Wi-Fi ↔ cellular) and calls
+ * `forceReconnect()` so a handoff re-establishes the socket without waiting for the backoff.
+ */
+class ListenTogetherRepositoryImpl(
+    private val session: ListenTogetherSession,
+    scope: CoroutineScope,
+    private val networkMonitor: org.simpmusic.listentogether.NetworkMonitor,
+) : ListenTogetherRepository {
+    private val _room = MutableStateFlow(ListenTogetherRoom())
+    override val room: StateFlow<ListenTogetherRoom> = _room.asStateFlow()
+
+    override var autoApproveJoins: Boolean
+        get() = session.autoApproveJoins
+        set(value) {
+            session.autoApproveJoins = value
+        }
+
+    override var autoApproveSuggestions: Boolean
+        get() = session.autoApproveSuggestions
+        set(value) {
+            session.autoApproveSuggestions = value
+        }
+
+    override var isBlockedUser: (String) -> Boolean
+        get() = session.isBlockedUser
+        set(value) {
+            session.isBlockedUser = value
+        }
+
+    init {
+        scope.launch { session.state.collect { _room.value = it.toDomain() } }
+
+        // Start the network monitor when the user is in a room (connection is alive and roomCode is set).
+        // Stop it when the room is left or the socket is dropped.
+        scope.launch {
+            session.state
+                .map { it.roomCode != null }
+                .distinctUntilChanged()
+                .collect { inRoom ->
+                    if (inRoom) {
+                        networkMonitor.start { session.forceReconnect() }
+                    } else {
+                        networkMonitor.stop()
+                    }
+                }
+        }
+    }
+
+    override fun connect() = session.connect()
+
+    override fun disconnect() = session.disconnect()
+
+    override fun createRoom(
+        username: String,
+        avatarUrl: String?,
+    ) {
+        session.createRoom(username, avatarUrl)
+    }
+
+    override fun joinRoom(
+        roomCode: String,
+        username: String,
+        avatarUrl: String?,
+    ) {
+        session.joinRoom(roomCode, username, avatarUrl)
+    }
+
+    override fun sendChatMessage(
+        text: String,
+        replyToId: String?,
+        replyToText: String?,
+        replyToSenderName: String?,
+    ) {
+        session.sendChatMessage(text, replyToId, replyToText, replyToSenderName)
+    }
+
+    override fun reactToMessage(
+        messageId: String,
+        emoji: String,
+    ) {
+        session.reactToChatMessage(messageId, emoji)
+    }
+
+    override fun cancelJoin() = session.cancelJoin()
+
+    override fun leaveRoom() {
+        session.leaveRoom()
+    }
+
+    override fun endRoom() {
+        session.endRoom()
+    }
+
+    override fun approveJoin(userId: String) {
+        session.approveJoin(userId)
+    }
+
+    override fun rejectJoin(userId: String) {
+        session.rejectJoin(userId)
+    }
+
+    override fun approveSuggestion(suggestionId: String) {
+        session.approveSuggestion(suggestionId)
+    }
+
+    override fun rejectSuggestion(suggestionId: String) {
+        session.rejectSuggestion(suggestionId)
+    }
+
+    override fun kickUser(userId: String) {
+        session.kickUser(userId)
+    }
+
+    override fun transferHost(userId: String) {
+        session.transferHost(userId)
+    }
+
+    override fun suggestTrack(track: RoomTrack) {
+        session.suggestTrack(track.toProtocol())
+    }
+
+    override fun playTrackDirect(track: RoomTrack) {
+        session.playTrackDirect(track.toProtocol())
+    }
+
+    override fun playQueuedTrack(index: Int, track: RoomTrack) {
+        session.playQueuedTrack(index, track.toProtocol())
+    }
+
+    override fun play() {
+        session.play()
+    }
+
+    override fun pause() {
+        session.pause()
+    }
+
+    override fun seekTo(position: Long) {
+        session.seekTo(position)
+    }
+
+    override fun addToQueue(track: RoomTrack) {
+        session.addToQueue(track.toProtocol())
+    }
+
+    override fun reorderQueue(fromIndex: Int, toIndex: Int) {
+        session.reorderQueue(fromIndex, toIndex)
+    }
+
+    override fun removeQueueItem(index: Int) {
+        session.removeQueueItem(index)
+    }
+
+    override fun updateJamPermissions(
+        allowQueue: Boolean,
+        allowReorder: Boolean,
+        allowPlayDirect: Boolean,
+        allowSeek: Boolean,
+        allowPlayPause: Boolean,
+    ) {
+        session.updateJamPermissions(
+            org.simpmusic.listentogether.JamPermissionsState(
+                allowQueue = allowQueue,
+                allowReorder = allowReorder,
+                allowPlayDirect = allowPlayDirect,
+                allowSeek = allowSeek,
+                allowPlayPause = allowPlayPause,
+            ),
+        )
+    }
+
+    override fun requestSync() {
+        session.requestSync()
+    }
+
+    override fun clearError() = session.clearError()
+}
+
+private fun ListenTogetherState.toDomain() =
+    ListenTogetherRoom(
+        connection = connection.toDomain(),
+        roomCode = roomCode,
+        selfUserId = selfUserId,
+        isHost = isHost,
+        members = members, // RoomMember from domain, shared between listenTogether service and domain
+        joinRequests = joinRequests.map { it.toDomain() },
+        suggestions = suggestions.map { it.toDomain() },
+        currentTrack = currentTrack?.toDomain(),
+        queue = queue.map { it.toDomain() },
+        isPlaying = isPlaying,
+        position = position,
+        permissions =
+            com.maxrave.domain.data.model.listentogether.JamPermissions(
+                allowQueue = permissions.allowQueue,
+                allowReorder = permissions.allowReorder,
+                allowPlayDirect = permissions.allowPlayDirect,
+                allowSeek = permissions.allowSeek,
+                allowPlayPause = permissions.allowPlayPause,
+            ),
+        chatMessages =
+            chatMessages.map {
+                com.maxrave.domain.data.model.listentogether.JamChatMessage(
+                    id = it.id,
+                    senderId = it.senderId,
+                    senderName = it.senderName,
+                    senderAvatar = it.senderAvatar,
+                    text = it.text,
+                    timestamp = it.timestamp,
+                    replyToId = it.replyToId,
+                    replyToText = it.replyToText,
+                    replyToSenderName = it.replyToSenderName,
+                    reactions = it.reactions,
+                )
+            },
+        waitingFor = waitingFor,
+        pendingJoinCode = pendingJoinCode,
+        error = error,
+    )
+
+private fun ConnectionState.toDomain(): RoomConnection =
+    when (this) {
+        ConnectionState.Disconnected -> RoomConnection.Disconnected
+        ConnectionState.Connecting -> RoomConnection.Connecting
+        is ConnectionState.Connected -> RoomConnection.Connected(serverVersion)
+        is ConnectionState.Failed -> RoomConnection.Failed(reason)
+    }
+
+private fun PendingJoin.toDomain() = RoomJoinRequest(userId = userId, username = username, avatarUrl = avatarUrl)
+
+private fun PendingSuggestion.toDomain() =
+    RoomSuggestion(
+        suggestionId = suggestionId,
+        fromUsername = fromUsername,
+        track = track.toDomain(),
+    )
+
+private fun TrackInfo.toDomain() =
+    RoomTrack(
+        id = id,
+        title = title,
+        artist = artist,
+        album = album,
+        durationMs = duration,
+        thumbnail = thumbnail,
+    )
+
+private fun RoomTrack.toProtocol() =
+    TrackInfo(
+        id = id,
+        title = title,
+        artist = artist,
+        album = album,
+        duration = durationMs,
+        thumbnail = thumbnail,
+    )
