@@ -310,17 +310,18 @@ class ListenTogetherPlaybackBridge(
                             }
                         val alreadyPlayingLocally = handler.nowPlaying.value?.mediaId == track.id
                         if (!alreadyPlayingLocally) {
-                            playTrack(track, keepPosition = startAt, playWhenReady = shouldPlay)
+                            // Pre-load the track in PAUSED state (playWhenReady = false) so both devices buffer silently at 0:00.
+                            // Playback begins synchronously once the buffer barrier releases.
+                            val initialPlay = if (isInitialJoin) shouldPlay else false
+                            playTrack(track, keepPosition = startAt, playWhenReady = initialPlay)
                         } else if (!isInitialJoin) {
-                            // The host's native player may have already advanced to this item
-                            // before its CHANGE_TRACK echo returns.
                             withContext(Dispatchers.Main) {
-                                if (shouldPlay) {
-                                    handler.player.seekTo(0L)
+                                handler.player.seekTo(0L)
+                                val canPlayNow = shouldPlay && repository.room.value.waitingFor.isEmpty()
+                                if (canPlayNow) {
                                     handler.player.play()
                                 } else {
                                     handler.player.pause()
-                                    handler.player.seekTo(0L)
                                 }
                             }
                         }
@@ -354,6 +355,9 @@ class ListenTogetherPlaybackBridge(
                             }
                             if (isPlaying && !handler.player.playWhenReady) {
                                 lastPublishedIsPlaying = true
+                                if (abs(handler.player.currentPosition) < 1000L && position < 1000L) {
+                                    handler.player.seekTo(0L)
+                                }
                                 handler.player.play()
                             } else if (!isPlaying && handler.player.playWhenReady) {
                                 lastPublishedIsPlaying = false
@@ -391,6 +395,9 @@ class ListenTogetherPlaybackBridge(
         // PLAY intent to be dropped on track transitions: the command arrived during buffer fill,
         // was skipped, and nothing ever retried it, leaving every new track permanently paused.
         if (isPlaying && !handler.player.playWhenReady) {
+            if (abs(handler.player.currentPosition) < 1000L && corrected < 1000L) {
+                handler.player.seekTo(0L)
+            }
             handler.player.play()
         } else if (!isPlaying && handler.player.playWhenReady) {
             handler.player.pause()
@@ -648,6 +655,7 @@ class ListenTogetherPlaybackBridge(
                 val state = repository.room.value
                 val canControl = state.isHost || state.permissions.allowPlayPause
                 if (!state.inRoom || !canControl || applyingRemote) return@collect
+                if (state.waitingFor.isNotEmpty()) return@collect
                 // A host that merely buffers reports isPlaying=false, indistinguishable from a
                 // user pause — and publishing it stops the WHOLE room on one device's hiccup.
                 // playWhenReady carries the intent, so a dip where the two disagree is not news.
@@ -726,7 +734,7 @@ class ListenTogetherPlaybackBridge(
         combine(
             repository.room.map { it.waitingFor to it.currentTrack?.id }.distinctUntilChanged(),
             handler.simpleMediaState,
-        ) { (waitingFor, trackId), _ ->
+        ) { (waitingFor, trackId), mediaState ->
             val room = repository.room.value
             if (trackId.isNullOrBlank() || !room.inRoom) return@combine
             if (room.selfUserId !in waitingFor) {
@@ -739,7 +747,10 @@ class ListenTogetherPlaybackBridge(
 
             // bufferedPercentage, not isPlaying: the barrier asks whether the track is loaded,
             // and playback is exactly what it is holding back.
-            if (handler.player.bufferedPercentage >= READY_BUFFER_PERCENT) {
+            val isReady = handler.player.bufferedPercentage >= READY_BUFFER_PERCENT ||
+                mediaState is SimpleMediaState.Ready ||
+                handler.player.duration > 0L
+            if (isReady) {
                 lastAnsweredTrackId = trackId
                 session.reportBufferReady(trackId)
             }
