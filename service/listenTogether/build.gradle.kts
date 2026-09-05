@@ -31,6 +31,18 @@ kotlin {
     jvm {
     }
 
+    // Mute the Kotlin 1.9.20+ beta warning for `expect`/`actual` classes (KT-61573). The
+    // wire-protocol codec MUST be expressed as `expect class` — protobuf-generated `actual`
+    // declarations cannot be JVM-only without stranding iOS and Desktop.
+    compilerOptions {
+        freeCompilerArgs.add("-Xexpect-actual-classes")
+    }
+
+    dependencies {
+        // koin-core has no version pin — version is supplied by the BOM.
+        implementation(platform(libs.koin.bom))
+    }
+
     sourceSets {
         commonMain {
             dependencies {
@@ -56,6 +68,8 @@ kotlin {
                 implementation(libs.ktor.client.websockets)
                 // Logger.
                 implementation(projects.common)
+                // Domain models used in session state: RoomMember, ListenTogetherRoom.
+                implementation(projects.domain)
             }
         }
 
@@ -63,6 +77,12 @@ kotlin {
             dependencies {
                 implementation(libs.kotlin.test)
             }
+        }
+
+        androidMain {
+            // No dependencies needed: NetworkMonitor now takes an Android Context via constructor
+            // injection, so it no longer needs KoinJavaComponent. The platform Koin module in
+            // core-data provides the context (it has koin-android as a direct dependency).
         }
     }
 }

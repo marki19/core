@@ -11,13 +11,14 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import org.simpmusic.listentogether.ConnectionState
 import org.simpmusic.listentogether.ListenTogetherSession
 import org.simpmusic.listentogether.ListenTogetherState
 import org.simpmusic.listentogether.PendingJoin
 import org.simpmusic.listentogether.PendingSuggestion
-import org.simpmusic.listentogether.RoomMember as ProtocolMember
 import org.simpmusic.listentogether.TrackInfo
 
 /**
@@ -26,10 +27,14 @@ import org.simpmusic.listentogether.TrackInfo
  * Everything above talks to [ListenTogetherRepository] in domain types; the protocol types stay
  * behind this boundary because they are not ours to change — they mirror Metrolist's `.proto`, and
  * a renamed field there is a client that cannot join a room.
+ *
+ * The [networkMonitor] watches for transport-type changes (Wi-Fi ↔ cellular) and calls
+ * `forceReconnect()` so a handoff re-establishes the socket without waiting for the backoff.
  */
 class ListenTogetherRepositoryImpl(
     private val session: ListenTogetherSession,
     scope: CoroutineScope,
+    private val networkMonitor: org.simpmusic.listentogether.NetworkMonitor,
 ) : ListenTogetherRepository {
     private val _room = MutableStateFlow(ListenTogetherRoom())
     override val room: StateFlow<ListenTogetherRoom> = _room.asStateFlow()
@@ -54,6 +59,21 @@ class ListenTogetherRepositoryImpl(
 
     init {
         scope.launch { session.state.collect { _room.value = it.toDomain() } }
+
+        // Start the network monitor when the user is in a room (connection is alive and roomCode is set).
+        // Stop it when the room is left or the socket is dropped.
+        scope.launch {
+            session.state
+                .map { it.roomCode != null }
+                .distinctUntilChanged()
+                .collect { inRoom ->
+                    if (inRoom) {
+                        networkMonitor.start { session.forceReconnect() }
+                    } else {
+                        networkMonitor.stop()
+                    }
+                }
+        }
     }
 
     override fun connect() = session.connect()
@@ -192,7 +212,7 @@ private fun ListenTogetherState.toDomain() =
         roomCode = roomCode,
         selfUserId = selfUserId,
         isHost = isHost,
-        members = members.map { it.toDomain() },
+        members = members, // RoomMember from domain, shared between listenTogether service and domain
         joinRequests = joinRequests.map { it.toDomain() },
         suggestions = suggestions.map { it.toDomain() },
         currentTrack = currentTrack?.toDomain(),
@@ -234,16 +254,6 @@ private fun ConnectionState.toDomain(): RoomConnection =
         is ConnectionState.Connected -> RoomConnection.Connected(serverVersion)
         is ConnectionState.Failed -> RoomConnection.Failed(reason)
     }
-
-private fun ProtocolMember.toDomain() =
-    RoomMember(
-        userId = userId,
-        username = username,
-        isHost = isHost,
-        isConnected = isConnected,
-        avatarUrl = avatarUrl,
-        isBuffering = isBuffering,
-    )
 
 private fun PendingJoin.toDomain() = RoomJoinRequest(userId = userId, username = username, avatarUrl = avatarUrl)
 

@@ -146,6 +146,34 @@ internal class SimpleMediaService :
         // from being killed due to process suspension while paused.
         val inRoom = listenTogetherRepository.room.value.inRoom
         super.onUpdateNotification(session, keepServiceAlive || inRoom || startInForegroundRequired)
+
+        // API 30+: re-assert the foreground type as mediaPlayback|connectedDevice when in a Jam
+        // room, because the connectedDevice bit is what tells the OS a paired / cast device is
+        // actively driving the service. Without it, the WebSocket can still be killed while the
+        // screen is off and the room is held.
+        if (inRoom && android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+            try {
+                val type = android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK or
+                    android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+                val notification = (getSystemService(NOTIFICATION_SERVICE) as android.app.NotificationManager)
+                    .activeNotifications
+                    .firstOrNull { it.id == com.maxrave.common.MEDIA_NOTIFICATION.NOTIFICATION_ID }
+                // Reflect on the protected startForeground(int, Notification, int) — only exists on API 30+.
+                val method = android.app.Service::class.java.getDeclaredMethod(
+                    "startForeground",
+                    Int::class.javaPrimitiveType,
+                    android.app.Notification::class.java,
+                    Int::class.javaPrimitiveType,
+                )
+                // If Media3 has already posted a notification, reuse it; otherwise post a minimal one.
+                if (notification != null) {
+                    method.invoke(this, notification.id, notification.notification, type)
+                }
+            } catch (t: Throwable) {
+                // Reflection failure must not crash the service; the default mediaPlayback type is
+                // still asserted by the super call above.
+            }
+        }
     }
 
     @UnstableApi

@@ -40,7 +40,7 @@ object MessageTypes {
     /**
      * Capability negotiation rides in an ordinary [Envelope] like everything else — the `.proto`
      * only says "first message from client" and never names the type, so these two strings come
-     * from the server itself: metroserver `internal/server/protocol.go`, `MsgTypeClientCapabilities`
+     * from the server itself: Metroserver `internal/server/protocol.go`, `MsgTypeClientCapabilities`
      * / `MsgTypeServerCapabilities`. Getting either one wrong is answered with `unknown_message_type`
      * and the handshake simply never completes.
      */
@@ -339,7 +339,7 @@ data class PongPayload(
     /**
      * Optional: server-authoritative playback state at the time the pong was sent.
      *
-     * These fields are zero/empty on unmodified metroserver deployments. When a server that has
+     * These fields are zero/empty on unmodified Metroserver deployments. When a server that has
      * been updated to populate them is deployed, the client can use them for a more accurate
      * drift correction than relying only on the timestamp of the last explicit action.
      *

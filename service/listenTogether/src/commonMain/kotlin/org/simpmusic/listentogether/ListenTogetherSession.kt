@@ -1,5 +1,6 @@
 package org.simpmusic.listentogether
 
+import com.maxrave.domain.data.model.listentogether.RoomMember
 import com.maxrave.logger.Logger
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -33,17 +34,6 @@ sealed interface ConnectionState {
     /** Retries are exhausted or the server refused us; the user has to act. */
     data class Failed(val reason: String) : ConnectionState
 }
-
-/** One person in the room, as the UI needs them. */
-data class RoomMember(
-    val userId: String,
-    val username: String,
-    val isHost: Boolean,
-    val isConnected: Boolean,
-    val avatarUrl: String? = null,
-    /** True while this member has not answered `buffer_ready` for the current track. */
-    val isBuffering: Boolean = false,
-)
 
 data class PendingJoin(
     val userId: String,
@@ -104,6 +94,7 @@ data class ListenTogetherState(
     val isConnected: Boolean get() = connection is ConnectionState.Connected
 
     /** Names, not ids — "Waiting for Long" is the only useful phrasing of the barrier. */
+    @Suppress("unused")
     val waitingForNames: List<String>
         get() = waitingFor.mapNotNull { id -> members.firstOrNull { it.userId == id }?.username }
 }
@@ -118,6 +109,11 @@ data class ListenTogetherState(
  */
 class ListenTogetherSession(
     private val client: ListenTogetherClient,
+    /**
+     * Wake lock to keep the CPU alive during a Jam session. Defaults to [JamWakeLockManager.noOp].
+     * On Android, Koin injects `AndroidJamWakeLockManager` which provides a real PARTIAL_WAKE_LOCK.
+     */
+    private val wakeLock: JamWakeLockManager = JamWakeLockManager.noOp,
     dispatcher: CoroutineContext = Dispatchers.Default,
 ) : CoroutineScope {
     override val coroutineContext: CoroutineContext = SupervisorJob() + dispatcher
@@ -126,16 +122,24 @@ class ListenTogetherSession(
     val state: StateFlow<ListenTogetherState> = _state.asStateFlow()
 
     /**
+     * Reconnection budget state, consumed by the UI to show a countdown.
+     */
+    @Suppress("unused")
+    val reconnectState: StateFlow<ReconnectState> = client.reconnectState
+
+    /**
      * Authoritative playback state from the server's pong response.
      *
      * Only emitted when the pong carries non-empty `authoritativeTrackId` (i.e. the server has
      * been updated to include room state in pong). Subscribers should check the track ID before
-     * acting. On stock metroserver this flow never emits.
+     * acting. On stock Metroserver this flow never emits.
      */
     private val _authoritativePong = MutableSharedFlow<ListenTogetherEvent.Pong>(extraBufferCapacity = 4)
     val authoritativePong: SharedFlow<ListenTogetherEvent.Pong> = _authoritativePong.asSharedFlow()
 
     private var pump: Job? = null
+    /** True once [connect] has been called at least once; guards against [forceReconnect] firing before the initial socket is opened. */
+    private var hasConnectedOnce = false
 
     /**
      * A track change is two protocol frames: CHANGE_TRACK clears the server's playing flag, then
@@ -153,12 +157,35 @@ class ListenTogetherSession(
         if (pump == null) {
             pump = launch { client.events.collect(::onEvent) }
         }
+        hasConnectedOnce = true
         _state.update { it.copy(connection = ConnectionState.Connecting, error = null) }
         client.connect()
     }
 
+    /**
+     * Forces a reconnect immediately, ignoring the current backoff delay.
+     *
+     * Intended for the network monitor: when the transport type changes (Wi-Fi → cellular, etc.),
+     * the existing socket is dead and there is no point waiting for the backoff to fire. The
+     * 5-minute budget is NOT reset — a handoff is a continuation of the same session.
+     *
+     * No-op if the initial [connect] has not run yet.
+     */
+    fun forceReconnect() {
+        if (!hasConnectedOnce) return
+        if (pump == null) {
+            pump = launch { client.events.collect(::onEvent) }
+        }
+        _state.update { it.copy(connection = ConnectionState.Connecting) }
+        client.forceReconnect()
+    }
+
     fun disconnect() {
         client.disconnect()
+        // Releasing the wake lock here is the right time: a user-initiated disconnect is the
+        // strongest signal that we are no longer in a room, and the wake lock should not survive
+        // the disconnect.
+        wakeLock.release()
         _state.value = ListenTogetherState()
     }
 
@@ -172,6 +199,8 @@ class ListenTogetherSession(
         pendingUsername = username.trim()
         pendingAvatar = avatarUrl?.trim()?.ifBlank { null }
         val wireUsername = if (pendingAvatar != null) "$pendingUsername\u001f$pendingAvatar" else pendingUsername
+        _state.update { it.copy(error = null) }
+        client.clearSessionToken()
         if (_state.value.connection !is ConnectionState.Connected) {
             connect()
             val connected = withTimeoutOrNull(20.seconds) {
@@ -195,6 +224,7 @@ class ListenTogetherSession(
         val code = roomCode.trim().uppercase()
         val wireUsername = if (pendingAvatar != null) "$pendingUsername\u001f$pendingAvatar" else pendingUsername
         _state.update { it.copy(pendingJoinCode = code, error = null) }
+        client.clearSessionToken()
         if (_state.value.connection !is ConnectionState.Connected) {
             connect()
             val connected = withTimeoutOrNull(20.seconds) {
@@ -211,28 +241,19 @@ class ListenTogetherSession(
         }
     }
 
-    /** Gives up on a join that has not been answered. Local only — the server needs no message. */
-    fun cancelJoin() = _state.update { it.copy(pendingJoinCode = null) }
+    /** Gives up on a join that has not been answered. */
+    fun cancelJoin() {
+        client.disconnect()
+        _state.update { it.copy(pendingJoinCode = null) }
+    }
 
     fun leaveRoom() =
         launch {
-            client.send(MessageTypes.LEAVE_ROOM, LeaveRoomPayload())
             client.clearSessionToken()
-            // The server sends nothing back for leave_room, so the local state is cleared here —
-            // waiting for a confirmation that never arrives would leave the room UI on screen.
-            _state.update {
-                it.copy(
-                    roomCode = null,
-                    isHost = false,
-                    members = emptyList(),
-                    joinRequests = emptyList(),
-                    suggestions = emptyList(),
-                    currentTrack = null,
-                    queue = emptyList(),
-                    chatMessages = emptyList(),
-                    waitingFor = emptyList(),
-                )
-            }
+            client.send(MessageTypes.LEAVE_ROOM, LeaveRoomPayload())
+            client.disconnect()
+            _state.value = ListenTogetherState()
+            wakeLock.release()
         }
 
     fun sendChatMessage(
@@ -524,7 +545,6 @@ class ListenTogetherSession(
     }
 
     fun addToQueue(track: TrackInfo) = launch {
-        val currentQueue = _state.value.queue
         if (_state.value.isHost || _state.value.permissions.allowQueue) {
             sendPlaybackActionFrame(
                 PlaybackActionPayload(
@@ -542,7 +562,7 @@ class ListenTogetherSession(
     fun removeQueueItem(index: Int) = launch {
         val currentQueue = _state.value.queue.toMutableList()
         if (index in currentQueue.indices) {
-            val item = currentQueue.removeAt(index)
+            currentQueue.removeAt(index)
             if (_state.value.isHost || _state.value.permissions.allowReorder) {
                 sendQueue(currentQueue)
             }
@@ -607,6 +627,7 @@ class ListenTogetherSession(
 
     fun release() {
         client.release()
+        wakeLock.release()
         pump = null
     }
 
@@ -634,6 +655,8 @@ class ListenTogetherSession(
                     } else {
                         // Losing the socket loses the room with it; leaving the room UI up would
                         // offer controls that silently do nothing.
+                        // Release the wake lock: if we are failing permanently, the CPU can sleep again.
+                        wakeLock.release()
                         ListenTogetherState(connection = ConnectionState.Failed(event.reason ?: "Disconnected"))
                     }
                 }
@@ -655,11 +678,15 @@ class ListenTogetherSession(
                         roomCode = p.roomCode,
                         selfUserId = p.userId,
                         isHost = true,
+                        error = null,
                         // The server sends no member list for a brand-new room: the host is alone
-                        // in it, and USER_JOINED carries everyone who arrives afterwards.
+                        // in it, and USER_JOINED carries everyone who arrives afterward.
                         members = listOf(RoomMember(p.userId, name, isHost = true, isConnected = true, avatarUrl = pendingAvatar ?: avatar)),
                     )
                 }
+                // Acquire the wake lock the moment a room is created — keeping the CPU running
+                // is what allows the WebSocket to survive longer pauses and screen-off conditions.
+                wakeLock.acquire()
             }
 
             MessageTypes.JOIN_APPROVED -> {
@@ -673,6 +700,7 @@ class ListenTogetherSession(
                         selfUserId = p.userId,
                         isHost = false,
                         pendingJoinCode = null,
+                        error = null,
                         members = p.state?.users.orEmpty().map { u -> u.toMember() },
                         queue = p.state?.queue.orEmpty(),
                         currentTrack = p.state?.currentTrack,
@@ -680,6 +708,27 @@ class ListenTogetherSession(
                         position = p.state?.position ?: 0L,
                     )
                 }
+                // Same as ROOM_CREATED: as soon as we are in a room, the CPU must stay on.
+                wakeLock.acquire()
+            }
+
+            MessageTypes.RECONNECTED -> {
+                val p = payload as? ReconnectedPayload ?: return
+                launch { client.send(MessageTypes.REQUEST_SYNC, null) }
+                _state.update {
+                    it.copy(
+                        roomCode = p.roomCode,
+                        selfUserId = p.userId,
+                        isHost = p.isHost,
+                        error = null,
+                        members = p.state?.users.orEmpty().map { u -> u.toMember() },
+                        queue = p.state?.queue.orEmpty(),
+                        currentTrack = p.state?.currentTrack,
+                        isPlaying = p.state?.isPlaying ?: false,
+                        position = p.state?.position ?: 0L,
+                    )
+                }
+                wakeLock.acquire()
             }
 
             MessageTypes.JOIN_REJECTED ->
@@ -764,6 +813,8 @@ class ListenTogetherSession(
                         connection = _state.value.connection,
                         error = (payload as? KickedPayload)?.reason?.ifBlank { "Jam session ended or you were removed" } ?: "Jam session ended or you were removed",
                     )
+                // The room is gone; the wake lock is no longer needed.
+                wakeLock.release()
             }
 
             MessageTypes.BUFFER_WAIT -> {
@@ -886,25 +937,37 @@ class ListenTogetherSession(
                 // `rate_limited` and `stale_track` are in-flight race conditions, not fatal session errors.
                 if (p.code != "rate_limited" && p.code != "stale_track") {
                     Logger.w(TAG, "Server error ${p.code}: ${p.message}")
-                    val isTerminal =
-                        p.code in setOf(
-                            "session_expired",
-                            "session_not_found",
-                            "room_not_found",
-                            "room_closed",
-                            "not_in_room",
-                        )
-                    if (isTerminal) {
-                        client.clearSessionToken()
-                        _state.update {
-                            ListenTogetherState(
-                                connection = it.connection,
-                                error = p.message.ifBlank { "Jam session expired or ended" },
-                            )
-                        }
+                    val isStaleError = 
+                        p.code in setOf("session_expired", "session_not_found", "room_closed", "not_in_room") && 
+                        _state.value.roomCode == null && 
+                        _state.value.pendingJoinCode == null
+
+                    if (isStaleError) {
+                        Logger.i(TAG, "Ignoring stale terminal error ${p.code} because we are not in a room")
+                        // Implicitly returning from the collect block
                     } else {
-                        _state.update {
-                            it.copy(pendingJoinCode = null, error = p.message.ifBlank { p.code })
+                        val isTerminal =
+                            p.code in setOf(
+                                "session_expired",
+                                "session_not_found",
+                                "room_not_found",
+                                "room_closed",
+                                "not_in_room",
+                            )
+                        if (isTerminal) {
+                            client.disconnect()
+                            _state.update {
+                                ListenTogetherState(
+                                    connection = ConnectionState.Disconnected,
+                                    error = p.message.ifBlank { "Jam session expired or ended" },
+                                )
+                            }
+                            // The session is no longer valid; the wake lock is no longer needed.
+                            wakeLock.release()
+                        } else {
+                            _state.update {
+                                it.copy(pendingJoinCode = null, error = p.message.ifBlank { p.code })
+                            }
                         }
                     }
                 }
@@ -926,7 +989,7 @@ fun parseUserAndAvatar(raw: String): Pair<String, String?> {
     if (httpIdx != null && httpIdx > 0) {
         val name = raw.substring(0, httpIdx).trim()
         val url = raw.substring(httpIdx).trim()
-        return (if (name.isBlank()) "User" else name) to url.ifBlank { null }
+        return name.ifBlank { "User" } to url.ifBlank { null }
     }
     return raw.trim() to null
 }

@@ -10,6 +10,7 @@ import com.maxrave.domain.mediaservice.handler.SimpleMediaState
 import com.maxrave.domain.repository.ListenTogetherRepository
 import com.maxrave.logger.Logger
 import kotlin.math.abs
+import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.TimeSource
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -184,7 +185,7 @@ class ListenTogetherPlaybackBridge(
      */
     private suspend fun periodicDriftCorrection() {
         while (true) {
-            delay(DRIFT_CHECK_INTERVAL_MS)
+            delay(DRIFT_CHECK_INTERVAL_MS.milliseconds)
             val room = repository.room.value
             if (!room.inRoom || !room.isPlaying || room.currentTrack == null) continue
             if (room.isHost || applyingRemote) continue
@@ -218,9 +219,9 @@ class ListenTogetherPlaybackBridge(
      *
      * Complements [periodicDriftCorrection]: while the timer fires every [DRIFT_CHECK_INTERVAL_MS]
      * regardless of connection activity, this reacts the moment the server sends a pong carrying
-     * an authoritative position (only possible once the metroserver fork is updated to populate
-     * those fields). On stock metroserver [session.authoritativePong] never emits — this is a
-     * zero-overhead forward-compatible hook.
+     * an authoritative position. This is only possible once the Metroserver fork is updated to
+     * populate those fields. On stock Metroserver, [session.authoritativePong] never emits. This
+     * is a zero-overhead forward-compatible hook.
      *
      * Uses [applyDriftCorrection] so this path also participates in correction-stacking prevention.
      */
@@ -285,13 +286,15 @@ class ListenTogetherPlaybackBridge(
                     val queueChanged = queueIds != lastAppliedQueueIds
                     val trackChanged = track != null && track.id.isNotBlank() && track.id != lastAppliedTrackId
 
+                    val wasRoomPlaying = lastRoomPlaying
                     lastRoomPlaying = isPlaying
 
                     if (trackChanged && track != null) {
                         val isInitialJoin = lastAppliedTrackId == null
                         lastAppliedTrackId = track.id
                         lastPublishedTrackId = track.id
-                        lastPublishedIsPlaying = isPlaying
+                        val shouldPlay = if (isInitialJoin) isPlaying else (isPlaying || wasRoomPlaying)
+                        lastPublishedIsPlaying = shouldPlay
                         lastAppliedQueueIds = queueIds
                         // Mark the start of a new track epoch. Drift correction is disabled for
                         // [NEW_TRACK_EPOCH_MS] after this point so a Member that becomes READY
@@ -306,20 +309,19 @@ class ListenTogetherPlaybackBridge(
                                 0L
                             }
                         val alreadyPlayingLocally = handler.nowPlaying.value?.mediaId == track.id
-                        // On a track transition, wait for the server's follow-up PLAY/PAUSE frame
-                        // so every client starts from the same paused loading state. A first join
-                        // is different: start immediately when the room is already playing.
-                        val shouldPlay = if (isInitialJoin) isPlaying else false
                         if (!alreadyPlayingLocally) {
                             playTrack(track, keepPosition = startAt, playWhenReady = shouldPlay)
                         } else if (!isInitialJoin) {
                             // The host's native player may have already advanced to this item
-                            // before its CHANGE_TRACK echo returns. Stop it at the shared start
-                            // position; the following PLAY frame is the only command that may
-                            // resume it.
+                            // before its CHANGE_TRACK echo returns.
                             withContext(Dispatchers.Main) {
-                                handler.player.pause()
-                                handler.player.seekTo(0L)
+                                if (shouldPlay) {
+                                    handler.player.seekTo(0L)
+                                    handler.player.play()
+                                } else {
+                                    handler.player.pause()
+                                    handler.player.seekTo(0L)
+                                }
                             }
                         }
                     } else if (queueChanged && track != null) {
@@ -351,8 +353,10 @@ class ListenTogetherPlaybackBridge(
                                 applyDriftCorrection(corrected)
                             }
                             if (isPlaying && !handler.player.playWhenReady) {
+                                lastPublishedIsPlaying = true
                                 handler.player.play()
                             } else if (!isPlaying && handler.player.playWhenReady) {
+                                lastPublishedIsPlaying = false
                                 handler.player.pause()
                             }
                         }

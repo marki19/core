@@ -29,14 +29,20 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.coroutines.CoroutineContext
+import kotlin.math.pow
 import kotlin.time.Duration
+import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
 import kotlin.time.TimeSource
 
@@ -125,7 +131,12 @@ class ListenTogetherClient(
 
     private val client: HttpClient =
         HttpClient(getEngine()) {
-            install(WebSockets)
+            install(WebSockets) {
+                // Keep the transport alive through Render.com's CDN/proxy idle timeout.
+                // Without this the connection is severed after ~10 s of inactivity at the WebSocket
+                // layer. We must send a ping *more often* than the 10s timeout, e.g. every 8s.
+                pingIntervalMillis = 8000L
+            }
         }
 
     private val serverClock = ServerClock(elapsedRealtime)
@@ -136,6 +147,15 @@ class ListenTogetherClient(
     private val _events = MutableSharedFlow<ListenTogetherEvent>(extraBufferCapacity = 256)
     val events: SharedFlow<ListenTogetherEvent> = _events.asSharedFlow()
 
+    /**
+     * Reconnect countdown for the UI. A null value means no active reconnect; a non-null value
+     * is the remaining milliseconds in the 5-minute budget. The UI uses this to render a
+     * "Reconnecting..." indicator with a countdown, and to disable the manual reconnect button
+     * while the budget is in its first attempts.
+     */
+    private val _reconnectState = MutableStateFlow<ReconnectState>(ReconnectState.Idle)
+    val reconnectState: StateFlow<ReconnectState> = _reconnectState.asStateFlow()
+
     private var codec = MessageCodec(compressionEnabled = true)
     private var session: DefaultClientWebSocketSession? = null
     private var connectionJob: Job? = null
@@ -145,6 +165,8 @@ class ListenTogetherClient(
     private var pingSequence = 0L
     private var reconnectDelay = INITIAL_RECONNECT_DELAY
     private var reconnectAttempts = 0
+    /** Monotonic timestamp (ms) at which the current reconnect budget started. */
+    private var reconnectBudgetStartMs: Long = 0
     /** Set when the server tells us retrying cannot help — see [MessageTypes.ERROR] handling. */
     private var fatal = false
 
@@ -166,14 +188,19 @@ class ListenTogetherClient(
      * Opens the connection, or does nothing if one is already open or opening.
      *
      * Reconnection is automatic from here on; callers do not call this again after a drop.
+     *
+     * The 5-minute reconnect budget is reset on a new connect() call. If the user calls connect()
+     * after a prior budget already elapsed, the server's room will already be gone and the first
+     * attempt will surface that error — the budget does not refund itself retroactively.
      */
     fun connect() {
-        // A deliberate start by the user, so the attempt budget begins again. The retry path
-        // deliberately calls [startConnection] instead of this: routing a retry through here would
-        // reset the counter every time and [MAX_RECONNECT_ATTEMPTS] would never be reached — the
-        // limit would look implemented and quietly never fire.
+        // Reset time budget and UI state. The attempt counter is kept across resets but it is only
+        // used for the initial rapid-retries window (1s + 2s + 4s + 8s + 16s); after that the
+        // budget-driven delay dominates and the attempt count is irrelevant.
         reconnectAttempts = 0
         reconnectDelay = INITIAL_RECONNECT_DELAY
+        reconnectBudgetStartMs = elapsedRealtime()
+        _reconnectState.value = ReconnectState.BudgetRunning(MAX_RECONNECT_BUDGET_MS)
         fatal = false
         startConnection()
     }
@@ -221,12 +248,30 @@ class ListenTogetherClient(
         Logger.i(TAG, "Disconnecting by request")
         sessionToken = null
         reconnectAttempts = 0
+        reconnectBudgetStartMs = 0
+        _reconnectState.value = ReconnectState.Idle
         connectionJob?.cancel()
         connectionJob = null
         launch {
             runCatching { session?.close() }
             session = null
         }
+    }
+
+    /**
+     * Force a reconnect now, ignoring the current backoff delay.
+     *
+     * Called by the network monitor when the transport type changes (Wi-Fi → cellular, etc.).
+     * The budget is NOT reset — a handoff is not a new session, it is a continuation of the
+     * same room, so the server's reconnect grace period still applies.
+     */
+    fun forceReconnect() {
+        if (connectionJob?.isActive == true) {
+            Logger.i(TAG, "Force reconnect requested — cancelling current attempt")
+            connectionJob?.cancel()
+            connectionJob = null
+        }
+        startConnection()
     }
 
     /** Releases the HTTP client too. The instance is unusable afterwards. */
@@ -272,8 +317,9 @@ class ListenTogetherClient(
                 }
 
                 val token = sessionToken
+                Logger.i(TAG, "Handshake complete. Current sessionToken=$token")
                 if (token != null) {
-                    Logger.i(TAG, "Resuming with stored session token")
+                    Logger.i(TAG, "Resuming with stored session token: $token")
                     send(MessageTypes.RECONNECT, ReconnectPayload(sessionToken = token))
                 }
 
@@ -282,6 +328,7 @@ class ListenTogetherClient(
                 // must not buy itself unlimited retries.
                 reconnectDelay = INITIAL_RECONNECT_DELAY
                 reconnectAttempts = 0
+                _reconnectState.value = ReconnectState.Idle
                 _events.emit(
                     ListenTogetherEvent.Connected(
                         serverVersion = caps.serverVersion,
@@ -388,6 +435,7 @@ class ListenTogetherClient(
     }
 
     fun clearSessionToken() {
+        Logger.i(TAG, "clearSessionToken called")
         sessionToken = null
     }
 
@@ -416,30 +464,54 @@ class ListenTogetherClient(
 
     private suspend fun scheduleReconnect() {
         if (fatal) {
+            _reconnectState.value = ReconnectState.Fatal
             _events.emit(ListenTogetherEvent.Disconnected("Server rejected this client", willRetry = false))
             return
         }
 
-        if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-            Logger.w(TAG, "Gave up after $MAX_RECONNECT_ATTEMPTS reconnection attempts")
-            // The token is dropped with the attempts: a later connect() is a fresh join, not a
+        // Calculate elapsed time since budget started
+        val nowMs = elapsedRealtime()
+        val elapsedMs = nowMs - reconnectBudgetStartMs
+
+        // If budget expired, emit fatal and stop retrying
+        if (elapsedMs >= RECONNECT_GRACE_MS) {
+            Logger.w(TAG, "Reconnect budget expired after ${elapsedMs / 1000}s")
+            // The token is dropped with the budget: a later connect() is a fresh join, not a
             // resume, and replaying a token the server may already have expired would be answered
             // with an error rather than a room.
             sessionToken = null
+            _reconnectState.value = ReconnectState.Fatal
             _events.emit(
                 ListenTogetherEvent.Disconnected(
-                    reason = "Could not reconnect after $MAX_RECONNECT_ATTEMPTS attempts",
+                    reason = "Could not reconnect within time budget",
                     willRetry = false,
                 ),
             )
             return
         }
 
+        // Compute remaining budget and derive a delay from it.
+        // We keep the old attempt-based scheme for the first few tries (1,2,4,8,16s) to handle
+        // transient blips, then switch to a linear spread of the remaining budget.
         reconnectAttempts++
-        Logger.i(TAG, "Reconnecting in $reconnectDelay (attempt $reconnectAttempts of $MAX_RECONNECT_ATTEMPTS)")
+        if (reconnectAttempts <= 5) {
+            // Use exponential backoff for first 5 attempts: 1s,2s,4s,8s,16s capped at MAX_RECONNECT_DELAY
+            // 2.0.pow(x) computes 2^x
+            reconnectDelay = (INITIAL_RECONNECT_DELAY * 2.0.pow(reconnectAttempts - 1)).coerceAtMost(MAX_RECONNECT_DELAY)
+        } else {
+            // After attempt 5, spread remaining budget linearly so that we use the full window
+            // This attempts to make at least one reconnect try every 5-30s depending on remaining time
+            val remainingMs = RECONNECT_GRACE_MS - elapsedMs
+            // Aim for at least 5 retries in the remaining time, min 1s between tries
+            reconnectDelay = maxOf((remainingMs / 5).milliseconds, INITIAL_RECONNECT_DELAY).coerceAtMost(MAX_RECONNECT_DELAY)
+        }
+
+        Logger.i(TAG, "Reconnecting in $reconnectDelay (attempt $reconnectAttempts, ${(RECONNECT_GRACE_MS - elapsedMs) / 1000}s budget left)")
         _events.emit(ListenTogetherEvent.Disconnected("Connection lost", willRetry = true))
+
+        _reconnectState.value = ReconnectState.BudgetRunning(RECONNECT_GRACE_MS - elapsedMs)
+
         delay(reconnectDelay)
-        reconnectDelay = (reconnectDelay * 2).coerceAtMost(MAX_RECONNECT_DELAY)
         connectionJob = null
         startConnection()
     }
@@ -457,24 +529,34 @@ class ListenTogetherClient(
 
         private val HANDSHAKE_TIMEOUT = 10.seconds
 
-        /** metroserver `client.go`: the read deadline is 60s and any inbound message refreshes it. */
+        /** Metroserver `client.go`: the read deadline is 60s and any inbound message refreshes it. */
         private val PING_INTERVAL = 15.seconds
         private val CALIBRATION_PING_INTERVAL = 1.seconds
         private const val CALIBRATION_PINGS = 3
 
-        private val INITIAL_RECONNECT_DELAY: Duration = 1.seconds
-        private val MAX_RECONNECT_DELAY: Duration = 60.seconds
+        /** Maximum time budget for reconnection in milliseconds (5 minutes). */
+        private val MAX_RECONNECT_BUDGET_MS = 5.minutes.inWholeMilliseconds
 
         /**
-         * How many times a dropped connection is retried before the user is told, in so many words,
-         * that it failed. The delay doubles each time — 1s, 2s, 4s, 8s, 16s — so five attempts span
-         * a little over half a minute of genuinely bad network before giving up rather than
-         * retrying into a flat battery.
+         * The server's own reconnect grace period — matches this so the client does not retry
+         * past the point where the server drops the room. After this budget elapses, the client
+         * emits fatal and the user must rejoin by hand.
          *
-         * Counted attempts, not elapsed time: the budget refills only on a COMPLETED handshake, so
-         * a server that accepts the socket and then goes quiet still exhausts it.
+         * Counted milliseconds since first reconnect attempt, not raw clock time. The budget
+         * refills only on a COMPLETED handshake, so a server that accepts the socket and then
+         * goes quiet still exhausts it. This is intentionally slightly shorter than the server's
+         * ReconnectGracePeriod to let the client surface the error before the server reaps the room.
          */
-        private const val MAX_RECONNECT_ATTEMPTS = 5
+        private val RECONNECT_GRACE_MS = 4.minutes.inWholeMilliseconds
+
+        /**
+         * Initial backoff between the first and second attempt, and the minimum interval between
+         * any two retry attempts. The full budget is 5 minutes; the first few attempts use short
+         * delays, and the remaining budget is spread over later attempts with exponential backoff
+         * capped at 16 seconds.
+         */
+        private val INITIAL_RECONNECT_DELAY: Duration = 1.seconds
+        private val MAX_RECONNECT_DELAY: Duration = 16.seconds
 
         /**
          * Errors where reconnecting repeats the same rejection. Everything else the server sends —
@@ -483,4 +565,18 @@ class ListenTogetherClient(
          */
         private val NON_RECOVERABLE_ERROR_CODES = setOf("unsupported_client")
     }
+}
+
+/**
+ * State of the reconnection budget, exposed to the UI layer.
+ */
+sealed interface ReconnectState {
+    /** No active reconnect; either connected or disconnected by user request. */
+    object Idle : ReconnectState
+
+    /** Reconnecting within the 5-minute budget. [remainingMs] is the time left. */
+    data class BudgetRunning(val remainingMs: Long) : ReconnectState
+
+    /** Budget exhausted or server rejected — user must act. */
+    object Fatal : ReconnectState
 }

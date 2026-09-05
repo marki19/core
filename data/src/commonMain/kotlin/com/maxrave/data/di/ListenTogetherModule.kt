@@ -11,8 +11,10 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import org.koin.core.qualifier.named
 import org.koin.dsl.module
+import org.simpmusic.listentogether.JamWakeLockManager
 import org.simpmusic.listentogether.ListenTogetherClient
 import org.simpmusic.listentogether.ListenTogetherSession
+import org.simpmusic.listentogether.NetworkMonitor
 
 /**
  * Listen Together lives for as long as the app does, not as long as its screen.
@@ -20,6 +22,10 @@ import org.simpmusic.listentogether.ListenTogetherSession
  * The session was originally created inside the ViewModel, which meant leaving the screen tore the
  * socket down and left the room — while playback, the thing the room is about, kept running in the
  * background. Singletons here, and the screen merely observes them.
+ *
+ * The wake lock is registered as a `single<JamWakeLockManager>` by the platform's actual module:
+ * see [platformListenTogetherModule] in androidMain / jvmMain. On Android, this provides a real
+ * `PARTIAL_WAKE_LOCK`; on Desktop and iOS, the no-op base class is used.
  */
 val listenTogetherModule =
     module {
@@ -33,13 +39,14 @@ val listenTogetherModule =
             )
         }
 
-        single { ListenTogetherSession(client = get()) }
+        single { ListenTogetherSession(client = get(), wakeLock = get()) }
 
         // The boundary: everything above this line speaks domain types only.
         single<ListenTogetherRepository> {
             ListenTogetherRepositoryImpl(
                 session = get(),
                 scope = get<CoroutineScope>(named(Config.SERVICE_SCOPE)),
+                networkMonitor = get<NetworkMonitor>(),
             )
         }
 

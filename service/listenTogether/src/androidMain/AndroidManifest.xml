@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- NetworkMonitor (androidMain) calls ConnectivityManager.getNetworkCapabilities and
+         ConnectivityManager.registerNetworkCallback; both require this permission. Declared
+         at the library level so lint sees it when analysing the module in isolation — the
+         app manifest in androidApp/ already declares it, so manifest merger deduplicates. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+</manifest>

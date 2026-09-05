@@ -45,6 +45,100 @@ class LiveRoomSyncTest {
 
     @Ignore
     @Test
+    fun testLeaveRoomAndCreateAgain() = runBlocking {
+        val host = session("simpmusic-host-test")
+        try {
+            host.connect()
+            assertNotNull(eventually("host connected") { host.state.value.isConnected.takeIf { it } }, "host never connected")
+            println("✓ connected")
+            host.createRoom("HostUser")
+            val code1 = eventually("room1 created") { host.state.value.roomCode }
+            assertNotNull(code1, "room1 not created")
+            println("✓ room1 created: $code1")
+
+            println("→ leaving room1")
+            host.leaveRoom()
+            delay(1000)
+            println("✓ left room1, state=${host.state.value}")
+
+            println("→ creating room2")
+            host.createRoom("HostUser2")
+            val code2 = eventually("room2 created") { host.state.value.roomCode }
+            println("state after room2: ${host.state.value}")
+            assertNotNull(code2, "room2 not created, error=${host.state.value.error}")
+            println("✓ room2 created: $code2")
+        } finally {
+            host.release()
+        }
+    }
+
+    @Ignore
+    @Test
+    fun testTwoClientsLeaveAndCrossJoinAndRecreate() = runBlocking {
+        val clientA = session("simpmusic-clientA")
+        val clientB = session("simpmusic-clientB")
+        try {
+            clientA.connect()
+            clientB.connect()
+            assertNotNull(eventually("clientA connected") { clientA.state.value.isConnected.takeIf { it } })
+            assertNotNull(eventually("clientB connected") { clientB.state.value.isConnected.takeIf { it } })
+            println("✓ both connected")
+
+            // 1. ClientA creates room1
+            clientA.createRoom("UserA")
+            val code1 = eventually("room1 created") { clientA.state.value.roomCode }
+            assertNotNull(code1, "room1 not created")
+            println("✓ clientA created room1: $code1")
+
+            // 2. ClientB joins room1
+            clientB.joinRoom(code1, "UserB")
+            val req = eventually("join req on A") { clientA.state.value.joinRequests.firstOrNull() }
+            assertNotNull(req, "clientA did not get join request")
+            clientA.approveJoin(req.userId)
+            val code1B = eventually("clientB joined room1") { clientB.state.value.roomCode }
+            assertNotNull(code1B, "clientB did not join room1")
+            println("✓ clientB joined room1: $code1B")
+
+            // 3. ClientB leaves room1
+            clientB.leaveRoom()
+            delay(500)
+            println("✓ clientB left room1")
+
+            // 4. ClientA leaves room1
+            clientA.leaveRoom()
+            delay(500)
+            println("✓ clientA left room1")
+
+            // 5. ClientB now creates room2
+            clientB.createRoom("UserB")
+            val code2 = eventually("room2 created by clientB") { clientB.state.value.roomCode }
+            assertNotNull(code2, "clientB could not create room2, err=${clientB.state.value.error}")
+            println("✓ clientB created room2: $code2")
+
+            // 6. ClientA joins room2
+            clientA.joinRoom(code2, "UserA")
+            val req2 = eventually("join req on B") { clientB.state.value.joinRequests.firstOrNull() }
+            assertNotNull(req2, "clientB did not get join request from clientA")
+            clientB.approveJoin(req2.userId)
+            val code2A = eventually("clientA joined room2") { clientA.state.value.roomCode }
+            assertNotNull(code2A, "clientA could not join room2, err=${clientA.state.value.error}")
+            println("✓ clientA joined room2: $code2A")
+
+            // 7. ClientA leaves room2 and creates room3
+            clientA.leaveRoom()
+            delay(500)
+            clientA.createRoom("UserA_Final")
+            val code3 = eventually("room3 created by clientA") { clientA.state.value.roomCode }
+            assertNotNull(code3, "clientA could not create room3, err=${clientA.state.value.error}")
+            println("✓ clientA left room2 and created room3: $code3")
+        } finally {
+            clientA.release()
+            clientB.release()
+        }
+    }
+
+    @Ignore
+    @Test
     fun aGuestFollowsTheHostThroughARealRoom() =
         runBlocking {
             val host = session("simpmusic-host-test")

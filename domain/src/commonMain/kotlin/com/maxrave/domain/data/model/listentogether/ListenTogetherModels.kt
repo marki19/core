@@ -97,6 +97,7 @@ data class ListenTogetherRoom(
     val isConnected: Boolean get() = connection is RoomConnection.Connected
 
     /** Names, not ids — "Waiting for Long" is the only useful phrasing of the barrier. */
+    @Suppress("unused")
     val waitingForNames: List<String>
         get() = waitingFor.mapNotNull { id -> members.firstOrNull { it.userId == id }?.username }
 }
