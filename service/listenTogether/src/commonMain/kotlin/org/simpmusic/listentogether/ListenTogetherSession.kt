@@ -366,7 +366,6 @@ class ListenTogetherSession(
             // This is what makes auto-advance (and manual NEXT) actually resume playback: a track
             // change without a follow-up PLAY/PAUSE leaves the new track permanently paused on
             // every client, including the host.
-            val wasPlaying = _state.value.isPlaying
             _state.update { it.copy(queue = updatedQueue) }
             sendTrackChangeAndRestoreIntent(
                 trackId = track.id,
@@ -374,7 +373,7 @@ class ListenTogetherSession(
                 trackInfo = track,
                 queue = updatedQueue,
                 queueTitle = formatJamPermissions(_state.value.permissions),
-                shouldPlay = wasPlaying,
+                shouldPlay = true,
             )
         }
 

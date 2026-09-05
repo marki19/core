@@ -73,6 +73,7 @@ class ListenTogetherPlaybackBridge(
     private var lastAppliedTrackId: String? = null
     private var lastAppliedQueueIds: List<String> = emptyList()
     private var lastPublishedIsPlaying: Boolean? = null
+    private var isPreBufferingTrack: Boolean = false
 
     /**
      * Whether the room was playing before the command currently being applied.
@@ -290,6 +291,7 @@ class ListenTogetherPlaybackBridge(
                     lastRoomPlaying = isPlaying
 
                     if (trackChanged && track != null) {
+                        isPreBufferingTrack = true
                         val isInitialJoin = lastAppliedTrackId == null
                         lastAppliedTrackId = track.id
                         lastPublishedTrackId = track.id
@@ -319,6 +321,7 @@ class ListenTogetherPlaybackBridge(
                                 handler.player.seekTo(0L)
                                 val canPlayNow = shouldPlay && repository.room.value.waitingFor.isEmpty()
                                 if (canPlayNow) {
+                                    isPreBufferingTrack = false
                                     handler.player.play()
                                 } else {
                                     handler.player.pause()
@@ -330,9 +333,11 @@ class ListenTogetherPlaybackBridge(
                         // Queue changed (reorder/add/remove): the room UI observes repository.room.value.queue.
                         // Do not touch active player timeline to prevent member restarts.
                     } else if (!isHost) {
+                        isPreBufferingTrack = false
                         // Apply play/pause transport or remote seek to guest.
                         applyTransport(isPlaying, position)
                     } else {
+                        isPreBufferingTrack = false
                         // On host: apply remote play/pause if a member with permission paused or
                         // resumed the room, and apply a remote seek if a member with seek permission
                         // dragged the scrubber. Without applying the seek here the host would keep
@@ -655,7 +660,7 @@ class ListenTogetherPlaybackBridge(
                 val state = repository.room.value
                 val canControl = state.isHost || state.permissions.allowPlayPause
                 if (!state.inRoom || !canControl || applyingRemote) return@collect
-                if (state.waitingFor.isNotEmpty()) return@collect
+                if (isPreBufferingTrack || state.waitingFor.isNotEmpty()) return@collect
                 // A host that merely buffers reports isPlaying=false, indistinguishable from a
                 // user pause — and publishing it stops the WHOLE room on one device's hiccup.
                 // playWhenReady carries the intent, so a dip where the two disagree is not news.
@@ -744,6 +749,10 @@ class ListenTogetherPlaybackBridge(
                 return@combine
             }
             if (lastAnsweredTrackId == trackId) return@combine
+
+            // Verify the local player has actually switched to the new track, not the previous song
+            val currentMediaId = handler.nowPlaying.value?.mediaId
+            if (currentMediaId != trackId) return@combine
 
             // bufferedPercentage, not isPlaying: the barrier asks whether the track is loaded,
             // and playback is exactly what it is holding back.
