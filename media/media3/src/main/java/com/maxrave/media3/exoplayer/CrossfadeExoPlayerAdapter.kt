@@ -22,6 +22,7 @@ import androidx.media3.exoplayer.audio.SilenceSkippingAudioProcessor
 import com.maxrave.domain.data.player.GenericCastState
 import com.maxrave.domain.data.player.GenericMediaItem
 import com.maxrave.domain.data.player.GenericPlaybackParameters
+import com.maxrave.domain.repository.ListenTogetherRepository
 import com.maxrave.domain.data.player.PlayerConstants
 import com.maxrave.domain.data.player.PlayerError
 import com.maxrave.domain.extension.isVideo
@@ -79,6 +80,7 @@ internal class CrossfadeExoPlayerAdapter(
     private val mediaSourceFactory: MergingMediaSourceFactory,
     private val audioAttributes: AudioAttributes,
     private val streamRepository: StreamRepository,
+    private val listenTogetherRepository: ListenTogetherRepository,
 ) : MediaPlayerInterface {
     // ========== Internal State Enum (same as GstreamerPlayerAdapter) ==========
 
@@ -125,6 +127,12 @@ internal class CrossfadeExoPlayerAdapter(
             dataStoreManager.crossfadeSkipAlbum.collect { enabled ->
                 skipCrossfadeInAlbum = (enabled == DataStoreManager.TRUE)
                 Logger.d(TAG, "Skip crossfade inside album: $skipCrossfadeInAlbum")
+            }
+        }
+        coroutineScope.launch {
+            listenTogetherRepository.room.collect { room ->
+                inJamRoom = room.inRoom
+                Logger.d(TAG, "Jam room active: $inJamRoom")
             }
         }
     }
@@ -328,6 +336,9 @@ internal class CrossfadeExoPlayerAdapter(
 
     @Volatile
     private var crossfadeJob: Job? = null
+
+    @Volatile
+    private var inJamRoom = false
 
     @Volatile
     private var isCrossfading = false
@@ -1940,6 +1951,7 @@ internal class CrossfadeExoPlayerAdapter(
         // Check if crossfade should be used
         val shouldCrossfade =
             crossfadeEnabled &&
+                !inJamRoom &&
                 !crossfadeSuppressed &&
                 hasNextMediaItem() &&
                 !isCrossfading &&
@@ -1989,9 +2001,11 @@ internal class CrossfadeExoPlayerAdapter(
     private fun triggerCrossfadeTransition(nextIndex: Int) {
         if (nextIndex !in playlist.indices || isCrossfading || isCastActive) return
 
+        // Set synchronously to prevent race condition with startPositionUpdates timer
+        setCrossfading(true)
+
         coroutineScope.launch {
             try {
-                setCrossfading(true)
                 val nextMediaItem = playlist[nextIndex]
                 val nextVideoId = nextMediaItem.mediaId
 
@@ -2832,6 +2846,7 @@ internal class CrossfadeExoPlayerAdapter(
                                 // is NOT precached, URL resolution + buffering time doesn't
                                 // eat into the audible crossfade window.
                                 if (crossfadeEnabled &&
+                                    !inJamRoom &&
                                     !crossfadeSuppressed &&
                                     !isCrossfading &&
                                     player.isPlaying &&
@@ -2892,7 +2907,7 @@ internal class CrossfadeExoPlayerAdapter(
      * and calls prepare(), which triggers URL resolution and buffering via MediaSourceFactory.
      */
     private fun triggerPrecachingInternal() {
-        if (!precacheEnabled || playlist.isEmpty() || isCastActive) return
+        if (!precacheEnabled || playlist.isEmpty() || isCastActive || inJamRoom) return
 
         cancelPrecaching()
         Logger.d(TAG, "Trigger precache")
