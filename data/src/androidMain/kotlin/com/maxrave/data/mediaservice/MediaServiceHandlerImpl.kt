@@ -1175,9 +1175,7 @@ internal class MediaServiceHandlerImpl(
         playWhenReady: Boolean,
     ) {
         player.clearMediaItems()
-        player.setMediaItem(mediaItem)
-        player.prepare()
-        player.playWhenReady = playWhenReady
+        player.setMediaItem(mediaItem, playWhenReady)
     }
 
     override fun clearMediaItems() {
@@ -2473,6 +2471,11 @@ internal class MediaServiceHandlerImpl(
             PlayerConstants.STATE_READY -> {
                 Logger.d(TAG, "onPlaybackStateChanged: Ready")
                 _simpleMediaState.value = SimpleMediaState.Ready(player.duration)
+            }
+
+            PlayerConstants.STATE_BUFFERING -> {
+                _simpleMediaState.value = SimpleMediaState.Buffering(player.currentPosition)
+                Logger.d(TAG, "onPlaybackStateChanged: Buffering")
             }
 
             else -> {

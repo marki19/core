@@ -34,6 +34,7 @@ private const val TAG = "ListenTogetherBridge"
 private data class RoomSnapshot(
     val track: RoomTrack?,
     val isPlaying: Boolean,
+    val isWaiting: Boolean,
     val position: Long,
     val queueIds: List<String>,
 )
@@ -271,6 +272,7 @@ class ListenTogetherPlaybackBridge(
                 RoomSnapshot(
                     track = it.currentTrack,
                     isPlaying = it.isPlaying,
+                    isWaiting = it.waitingFor.isNotEmpty(),
                     position = it.position,
                     queueIds = it.queue.map { t -> t.id },
                 ) to it.inRoom
@@ -278,7 +280,7 @@ class ListenTogetherPlaybackBridge(
             .distinctUntilChanged()
             .collect { (snapshot, inRoom) ->
                 if (!inRoom) return@collect
-                val (track, isPlaying, position, queueIds) = snapshot
+                val (track, isPlaying, isWaiting, position, queueIds) = snapshot
                 val isHost = repository.room.value.isHost
 
                 Logger.i(TAG, "Room says (${if (isHost) "host" else "guest"}): track=${track?.id} playing=$isPlaying pos=$position queue=${queueIds.size}")
@@ -335,7 +337,7 @@ class ListenTogetherPlaybackBridge(
                     } else if (!isHost) {
                         isPreBufferingTrack = false
                         // Apply play/pause transport or remote seek to guest.
-                        applyTransport(isPlaying, position)
+                        applyTransport(isPlaying, position, isWaiting)
                     } else {
                         isPreBufferingTrack = false
                         // On host: apply remote play/pause if a member with permission paused or
@@ -358,13 +360,15 @@ class ListenTogetherPlaybackBridge(
                                 )
                                 applyDriftCorrection(corrected)
                             }
-                            if (isPlaying && !handler.player.playWhenReady) {
+                            
+                            val shouldPlayNow = isPlaying && !isWaiting
+                            if (shouldPlayNow && !handler.player.playWhenReady) {
                                 lastPublishedIsPlaying = true
                                 if (abs(handler.player.currentPosition) < 1000L && position < 1000L) {
                                     handler.player.seekTo(0L)
                                 }
                                 handler.player.play()
-                            } else if (!isPlaying && handler.player.playWhenReady) {
+                            } else if (!shouldPlayNow && handler.player.playWhenReady) {
                                 lastPublishedIsPlaying = false
                                 handler.player.pause()
                             }
@@ -381,6 +385,7 @@ class ListenTogetherPlaybackBridge(
     private suspend fun applyTransport(
         isPlaying: Boolean,
         position: Long,
+        isWaiting: Boolean,
     ) = withContext(Dispatchers.Main) {
         // Correct the position for however long the command spent in flight; ServerClock falls back
         // to the raw value whenever it is not calibrated yet.
@@ -399,12 +404,14 @@ class ListenTogetherPlaybackBridge(
         // the buffer fills — the previous check (which skipped play() while buffering) caused the
         // PLAY intent to be dropped on track transitions: the command arrived during buffer fill,
         // was skipped, and nothing ever retried it, leaving every new track permanently paused.
-        if (isPlaying && !handler.player.playWhenReady) {
+        
+        val shouldPlayNow = isPlaying && !isWaiting
+        if (shouldPlayNow && !handler.player.playWhenReady) {
             if (abs(handler.player.currentPosition) < 1000L && corrected < 1000L) {
                 handler.player.seekTo(0L)
             }
             handler.player.play()
-        } else if (!isPlaying && handler.player.playWhenReady) {
+        } else if (!shouldPlayNow && handler.player.playWhenReady) {
             handler.player.pause()
         }
     }
@@ -658,9 +665,11 @@ class ListenTogetherPlaybackBridge(
             .distinctUntilChanged()
             .collect { isPlaying ->
                 val state = repository.room.value
-                val canControl = state.isHost || state.permissions.allowPlayPause
+                val canControl = state.isHost
                 if (!state.inRoom || !canControl || applyingRemote) return@collect
                 if (isPreBufferingTrack || state.waitingFor.isNotEmpty()) return@collect
+                val nowMs = PROCESS_START.elapsedNow().inWholeMilliseconds
+                if (nowMs - trackEpochMs < NEW_TRACK_EPOCH_MS) return@collect
                 // A host that merely buffers reports isPlaying=false, indistinguishable from a
                 // user pause — and publishing it stops the WHOLE room on one device's hiccup.
                 // playWhenReady carries the intent, so a dip where the two disagree is not news.
@@ -757,8 +766,7 @@ class ListenTogetherPlaybackBridge(
             // bufferedPercentage, not isPlaying: the barrier asks whether the track is loaded,
             // and playback is exactly what it is holding back.
             val isReady = handler.player.bufferedPercentage >= READY_BUFFER_PERCENT ||
-                mediaState is SimpleMediaState.Ready ||
-                handler.player.duration > 0L
+                mediaState is SimpleMediaState.Ready
             if (isReady) {
                 lastAnsweredTrackId = trackId
                 session.reportBufferReady(trackId)

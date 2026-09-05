@@ -46,6 +46,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.PI
 import kotlin.math.abs
@@ -72,7 +73,6 @@ private const val TAG = "CrossfadeExoPlayerAdapter"
  * - Each ExoPlayer gets a single [MediaItem] and auto-resolves the stream URL
  */
 @SuppressLint("UnsafeOptInUsageError")
-@OptIn(UnstableApi::class)
 internal class CrossfadeExoPlayerAdapter(
     private val context: Context,
     private val coroutineScope: CoroutineScope,
@@ -385,6 +385,8 @@ internal class CrossfadeExoPlayerAdapter(
 
     // Loading management
     private var currentLoadJob: Job? = null
+    @Volatile
+    private var currentLoadGeneration = 0L
 
     // ========== ForwardingPlayer for MediaSession ==========
 
@@ -585,8 +587,8 @@ internal class CrossfadeExoPlayerAdapter(
 
     override fun play() {
         Logger.d(TAG, "play() called (state: $internalState, playWhenReady: $internalPlayWhenReady)")
+        internalPlayWhenReady = true
         castRemotePlayer?.let { remote ->
-            internalPlayWhenReady = true
             remote.play()
             return
         }
@@ -611,6 +613,7 @@ internal class CrossfadeExoPlayerAdapter(
                 InternalState.PREPARING -> {
                     internalPlayWhenReady = true
                     Logger.d(TAG, "Play: During PREPARING - will auto-play when ready")
+                    currentPlayer?.play()
                 }
 
                 InternalState.PLAYING -> {
@@ -627,8 +630,8 @@ internal class CrossfadeExoPlayerAdapter(
 
     override fun pause() {
         Logger.d(TAG, "pause() called (state: $internalState, playWhenReady: $internalPlayWhenReady)")
+        internalPlayWhenReady = false
         castRemotePlayer?.let { remote ->
-            internalPlayWhenReady = false
             remote.pause()
             // The coroutine below never runs on this path, so the sleep attenuation has to be
             // cleared here too. Left set, it would outlive the cast session: the processor stays in
@@ -660,6 +663,7 @@ internal class CrossfadeExoPlayerAdapter(
 
                     InternalState.PREPARING -> {
                         internalPlayWhenReady = false
+                        currentPlayer?.pause()
                     }
 
                     else -> {
@@ -849,6 +853,14 @@ internal class CrossfadeExoPlayerAdapter(
     // ========== Media Item Management ==========
 
     override fun setMediaItem(mediaItem: GenericMediaItem) {
+        setMediaItem(mediaItem, internalPlayWhenReady)
+    }
+
+    override fun setMediaItem(
+        mediaItem: GenericMediaItem,
+        playWhenReady: Boolean,
+    ) {
+        internalPlayWhenReady = playWhenReady
         coroutineScope.launch {
             // Cancel ongoing operations
             currentLoadJob?.cancel()
@@ -864,7 +876,7 @@ internal class CrossfadeExoPlayerAdapter(
             }
 
             notifyTimelineChanged("TIMELINE_CHANGE_REASON_PLAYLIST_CHANGED")
-            loadAndPlayTrackInternal(0, 0, internalPlayWhenReady)
+            loadAndPlayTrackInternal(0, 0, playWhenReady)
         }
     }
 
@@ -1475,11 +1487,18 @@ internal class CrossfadeExoPlayerAdapter(
 
         // Cancel previous load
         currentLoadJob?.cancel()
+        val loadGen = ++currentLoadGeneration
 
         currentLoadJob =
             coroutineScope.launch {
+                var playerToReleaseOnError: ExoPlayer? = null
+                var playerAttached = false
                 try {
+                    if (loadGen != currentLoadGeneration) return@launch
                     transitionToState(InternalState.PREPARING)
+                    cachedPosition = startPositionMs
+                    cachedDuration = 0L
+                    cachedBufferedPosition = 0L
 
                     // Notify media item transition
                     listeners.forEach {
@@ -1522,6 +1541,9 @@ internal class CrossfadeExoPlayerAdapter(
                         player.setMediaItem(mediaItem.toMedia3MediaItem())
                         player.prepare()
                     }
+                    playerToReleaseOnError = player
+
+                    if (!isActive || loadGen != currentLoadGeneration) return@launch
 
                     // === CAREFUL ORDER for ForwardingPlayer integration ===
 
@@ -1538,6 +1560,7 @@ internal class CrossfadeExoPlayerAdapter(
                     // 3. Set new player as current
                     currentPlayer = player
                     currentPlayerFilter = playerFilter
+                    playerAttached = true
 
                     // 4. Setup our listener on new player
                     setupPlayerListenerInternal(player)
@@ -1577,8 +1600,9 @@ internal class CrossfadeExoPlayerAdapter(
                         cachedPosition = startPositionMs
                     }
 
-                    // Auto-play if requested
-                    if (shouldPlay) {
+                    // Auto-play if requested or if play() was already requested
+                    val effectivePlay = shouldPlay || internalPlayWhenReady
+                    if (effectivePlay) {
                         internalPlayWhenReady = true
                         requestAudioFocusInternal()
                         player.play()
@@ -1592,7 +1616,11 @@ internal class CrossfadeExoPlayerAdapter(
                     } else {
                         internalPlayWhenReady = false
                         player.pause()
-                        transitionToState(InternalState.READY)
+                        if (player.playbackState == Player.STATE_READY) {
+                            transitionToState(InternalState.PAUSED)
+                        } else {
+                            transitionToState(InternalState.PREPARING)
+                        }
                     }
 
                     forwardingPlayer.suppressPlaybackEnded = false
@@ -1613,6 +1641,15 @@ internal class CrossfadeExoPlayerAdapter(
                     Logger.e(TAG, "Load track error: ${e.message}", e)
                     forwardingPlayer.suppressPlaybackEnded = false
                     transitionToState(InternalState.ERROR)
+                } finally {
+                    if (!playerAttached && playerToReleaseOnError != null) {
+                        try {
+                            playerToReleaseOnError.stop()
+                            playerToReleaseOnError.release()
+                        } catch (e: Exception) {
+                            Logger.w(TAG, "Error releasing unattached player: ${e.message}")
+                        }
+                    }
                 }
             }
     }
@@ -1663,8 +1700,12 @@ internal class CrossfadeExoPlayerAdapter(
                             retryVideoId = null
 
                             // Transition to PLAYING once buffer is ready if auto-play was requested
-                            if (internalState == InternalState.PREPARING && internalPlayWhenReady && player == currentPlayer) {
-                                transitionToState(InternalState.PLAYING)
+                            if (internalState == InternalState.PREPARING && player == currentPlayer) {
+                                if (internalPlayWhenReady) {
+                                    transitionToState(InternalState.PLAYING)
+                                } else {
+                                    transitionToState(InternalState.READY)
+                                }
                             }
                         }
 
@@ -2907,15 +2948,22 @@ internal class CrossfadeExoPlayerAdapter(
      * and calls prepare(), which triggers URL resolution and buffering via MediaSourceFactory.
      */
     private fun triggerPrecachingInternal() {
-        if (!precacheEnabled || playlist.isEmpty() || isCastActive || inJamRoom) return
+        if (!precacheEnabled || playlist.isEmpty() || isCastActive) return
 
         cancelPrecaching()
         Logger.d(TAG, "Trigger precache")
         precacheJob =
             coroutineScope.launch {
                 try {
-                    // Small delay to let current track start downloading/playing before initiating background precache
-                    delay(500)
+                    // Smart delay: wait for the current track to be ready (buffered) so we don't steal bandwidth
+                    withTimeoutOrNull(5000) {
+                        while (isActive && currentPlayer?.playbackState != Player.STATE_READY) {
+                            delay(200)
+                        }
+                    }
+                    // Additional small delay to let it build a healthy buffer
+                    delay(1000)
+                    
                     if (!isActive) return@launch
 
                     val indicesToPrecache = mutableListOf<Int>()
